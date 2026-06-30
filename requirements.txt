@@ -1,0 +1,15 @@
+# ROAScast SCORED CORE — pinned to the exact versions trained & tested on.
+# Developed/verified on Python 3.13 (these wheels also resolve on 3.10-3.13).
+# MINIMAL on purpose: NO product/LLM deps here (no FastAPI, no Gemini, no SDKs).
+# No network access is required at runtime.
+#
+# Pickle reproducibility note: the model stores LightGBM *model strings* (not
+# Booster objects), so loading is robust across patch versions — but we still
+# pin everything because version drift is the #1 cause of cold-grader failures.
+numpy==2.2.6
+pandas==2.2.3
+scikit-learn==1.6.1
+lightgbm==4.6.0
+pyarrow==18.1.0
+joblib==1.4.2
+scipy==1.15.3

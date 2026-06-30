@@ -1,0 +1,19 @@
+# PRODUCT LAYER ONLY — the online half on the far side of the network wall.
+# run.sh NEVER installs this file. The scored core (requirements.txt) stays
+# network-free and minimal; the LLM and web framework live ONLY here.
+#
+# These are intentionally unpinned (not scored); pin them when the product layer
+# is built (Phase 2). Kept here to document the architecture, not to install now.
+-r requirements.txt
+
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+
+# LLM narrative layer (grounded, low-temperature) — Gemini with a Groq fallback.
+google-generativeai
+groq
+
+# Session CSV storage for the product (GCS / Firebase).
+google-cloud-storage

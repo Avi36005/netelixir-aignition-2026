@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments (keep secrets out from day one — the product layer will have keys)
+.env
+.venv/
+venv/
+env/
+
+# Run artifacts
+output/
+*.parquet
+
+# OS
+.DS_Store
+
+# IMPORTANT: the trained model IS committed — never ignore it, and no Git LFS
+# (the grading pipeline cannot pull LFS objects).
+!pickle/
+!pickle/model.pkl

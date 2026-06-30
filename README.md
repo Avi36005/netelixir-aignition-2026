@@ -1,0 +1,255 @@
+# ROAScast — Probabilistic Revenue & ROAS Forecasting (Scored Core)
+
+**NetElixir AIgnition 3.0 · Team Kryptonite**
+
+A reproducible, offline forecasting core that predicts **probabilistic e-commerce
+revenue and ROAS** from Google Ads and Meta Ads exports, at the
+**blended / channel / campaign-type / campaign** levels over **30 / 60 / 90-day**
+windows. This repository is the **scored Track-1 core**: it runs end-to-end with
+**no network access**, loads a **committed, pre-trained model**, and writes a
+single `predictions.csv`.
+
+> The online product layer (FastAPI + React dashboard + LLM narratives) lives on
+> the *other side of a strict network wall* and is **not** in this repo — see
+> [Architecture](#architecture). The LLM is product-only by design, because the
+> scorer runs with the internet disabled.
+
+---
+
+## Quick start
+
+```bash
+# Python 3.13 (verified). Wheels also resolve on 3.10–3.13.
+pip install -r requirements.txt
+./run.sh ./data ./pickle/model.pkl ./output/predictions.csv
+```
+
+That single command generates features from whatever CSVs are in `./data`, loads
+`./pickle/model.pkl`, and writes `./output/predictions.csv`. It also works with
+no arguments (same defaults) and via `bash run.sh ...`.
+
+**Exact command for the grader:**
+
+```bash
+./run.sh ./data ./pickle/model.pkl ./output/predictions.csv
+```
+
+- **Python version:** 3.13 (developed & tested). The pinned dependencies publish
+  wheels for CPython 3.10–3.13.
+- **No internet at runtime.** Everything (model, lookups, logic) is in the repo.
+- **No retraining at test time.** `run.sh` only generates features and predicts.
+
+---
+
+## Output schema (`predictions.csv`)
+
+One file covers all three windows. Columns, in order:
+
+| column | meaning |
+|---|---|
+| `level` | `blended` \| `channel` \| `campaign_type` \| `campaign` (coarser levels leave finer columns blank) |
+| `channel` | `google` \| `meta` \| `microsoft` \| `other` |
+| `campaign_type` | `Search`, `Shopping`, `PerformanceMax`, `Display`, `Video`, `DemandGen`, `Prospecting`, `Retargeting`, `Brand`, `DPA`, `Other` |
+| `campaign` | campaign name (campaign-level rows only) |
+| `window_days` | `30` \| `60` \| `90` (aggregate total for the window — **never daily**) |
+| `revenue_p10/p50/p90` | revenue quantiles, **USD** |
+| `roas_p10/p50/p90` | ROAS quantiles — a **dimensionless multiple** (never `$`) |
+
+`P10 ≤ P50 ≤ P90` is guaranteed for both revenue and ROAS, and the hierarchy is
+**coherent**: campaign sums to campaign-type sums to channel sums to blended.
+
+> ⚠️ **The exact scored schema is a Q&A item** (column names / required
+> granularities / one file vs one-per-window). It is defined in **one place** —
+> `src/forecasting/schema.py` — so matching the announced format is a one-line
+> edit. See [Open items](#open-items-to-confirm-via-qa).
+
+---
+
+## Architecture
+
+One repository, two halves, separated by the **network wall**. Both halves share
+a single forecasting core (`src/forecasting/`), so the demo and the scored output
+can never disagree on the math.
+
+```
+            Google Ads CSV        Meta Ads CSV
+                   \                 /
+              ┌─────────────────────────────────┐
+              │   SHARED FORECASTING CORE        │
+              │   mapping · features · quantile  │
+              │   model · curves · reconcile     │
+              └───────────────┬─────────────────┘
+                              │
+      ┌───────────────────────┴────────────────────────┐
+      │ TRACK 1 (THIS REPO)         ││ TRACK 2 (separate) │
+      │ run.sh — OFFLINE, no net    ││ FastAPI+React+LLM  │
+      │ → predictions.csv (scored)  ││ demo / finale      │
+      └─────────────────────────────┘└────────────────────┘
+                                 ↑ network wall — LLM lives ONLY on the right
+```
+
+### Repository layout
+
+```
+roascast/
+├── run.sh                      # entry point (exact name, root, executable)
+├── requirements.txt            # MINIMAL + pinned (scored core only)
+├── requirements-product.txt    # product layer deps — run.sh NEVER installs this
+├── data/                       # committed sample data; overwritten at test time
+├── pickle/model.pkl            # committed trained model; loads offline
+├── src/
+│   ├── generate_features.py    # data/ -> features.parquet  (CLI)
+│   ├── predict.py              # features + model -> predictions.csv  (CLI)
+│   ├── train.py                # OFFLINE; writes model.pkl  (NOT in run path)
+│   ├── backtest.py             # time-based validation report
+│   ├── make_sample_data.py     # synthetic sample-data generator
+│   └── forecasting/            # the shared core (imported by predict AND the API)
+│       ├── schema.py           # output columns + currency — single source of truth
+│       ├── mapping.py          # Google/Meta/MS channel + campaign-type normalization
+│       ├── features.py         # feature engineering (no campaign identity)
+│       ├── model.py            # ForecastModel: train / load / predict
+│       ├── curves.py           # per-channel budget→revenue response curves
+│       └── reconcile.py        # bottom-up hierarchy aggregation
+└── tests/test_pipeline.py      # smoke + contract + coherence tests
+```
+
+---
+
+## Methodology
+
+### Model
+A **single global gradient-boosting model** (LightGBM) rather than per-series
+ARIMA/Prophet: the data is short, multi-series and sparse, so pooling across all
+campaigns and letting **budget enter as a feature** generalizes far better — and
+it scores **brand-new campaigns** from their attributes + behaviour.
+
+- **Probabilistic ranges:** three quantile regressors at `alpha = 0.1 / 0.5 / 0.9`
+  → P10 / P50 / P90 directly.
+- **Quantile-crossing fix:** the three predictions are sorted row-wise so
+  `P10 ≤ P50 ≤ P90` always.
+- **Calibrated intervals (a headline differentiator):** a time-based split learns
+  a single interval-width multiplier so out-of-sample coverage targets ~80% — the
+  point forecast (P50) is never altered. Measured coverage is reported below.
+- **Spend is a known input.** We forecast **revenue given a budget** and derive
+  ROAS = revenue ÷ spend. ROAS is never modelled directly.
+
+### Features (per `campaign × window`)
+- **Never campaign identity.** No campaign-name/ID encoding — the held-out set has
+  unseen campaigns; identity features would assign garbage. We use **attributes +
+  behaviour** only.
+- **Attributes:** channel, campaign_type, is_brand.
+- **Trailing behaviour:** 14/28-day revenue, spend, ROAS, conversions, clicks,
+  impressions, CTR, CVR, CPC; WoW/MoM growth; daily spend rate; active days.
+- **Calendar / seasonality:** month, week-of-month, trend index, a learned monthly
+  seasonal index, and an explicit **US retail calendar** (Black Friday, Cyber
+  Monday, the Nov–Dec peak) — a 30/60/90-day window crossing BFCM moves revenue
+  enormously, so the model must know.
+- **Budget (`budget_input`):** the planned spend for the window. Its derivation is
+  isolated in `features.derive_budget_input()` (see [Assumptions](#assumptions)).
+- **Defensive computation:** every feature falls back (group mean → channel mean →
+  global mean → 0). No NaN ever reaches the model.
+
+### Budget response curves
+A **per-channel saturating Hill curve** is fitted on historical `(spend, revenue)`
+pairs (pure NumPy, no scipy). It makes diminishing returns explicit, powers the
+budget what-if simulator, and is **monotone increasing by construction** — which is
+how we guarantee "revenue cannot fall as budget rises" (see the note below).
+Curves are **independent per channel** — deliberately **not** a media-mix model.
+
+> **Monotonicity note.** LightGBM rejects `monotone_constraints` under the
+> `quantile` objective. We therefore guarantee budget→revenue monotonicity
+> *structurally*: (a) the saturating response curves used for every budget what-if
+> are monotone by construction, and (b) any budget sweep through the GBM is passed
+> through an isotonic (cumulative-max) step (`model.predict_budget_sweep`). The
+> scored output uses one budget per entity, where row-wise monotonicity does not
+> apply.
+
+### Reconciliation
+We predict at the **campaign** level and aggregate **upward** to
+campaign-type → channel → blended. Summing medians is exact; summing the P10/P90
+bounds is a stated interval approximation. ROAS at each level is revenue ÷ total
+planned spend at that level.
+
+---
+
+## Validation
+
+A **time-based backtest** (`python src/backtest.py`) mimics the scorer: train on
+an earlier period, hold out the forward 30/60/90-day window, predict, and score
+against realized actuals. On the committed sample data:
+
+| metric | result | notes |
+|---|---|---|
+| **Interval coverage** | **~82%** | fraction of actuals inside P10–P90 (target ~80%) — the credibility number |
+| **MAPE on P50** | **~9%** | interpretable median revenue accuracy |
+| **Pinball loss** | reported | the likely scoring metric for probabilistic output |
+
+Coverage is held near 80% across all three windows. (Exact numbers print when you
+run the backtest; they depend on the committed sample data.)
+
+---
+
+## Assumptions
+
+- **Spend is a known input**, not a forecast target. We forecast revenue given a
+  budget and derive ROAS. `budget_input` is set in **one** documented place
+  (`features.derive_budget_input`): at **training** it is the realized spend over
+  the target window; at **prediction** it is the trailing 28-day spend
+  extrapolated across the window (or an explicit future-spend column if the test
+  set provides one — a one-line switch).
+- **Existing platform attribution is the source of truth**, used as-is. No custom
+  attribution engine.
+- **Blended total = simple sum** across Google + Meta. Google/Meta attribution
+  overlap (a conversion can be claimed by both) is **acknowledged, not
+  deduplicated** — deduplication would require an attribution model, which is out
+  of scope.
+- All monetary values are **USD**, native to the exports (no FX conversion).
+
+## Limitations
+
+- **Limited history → limited seasonality.** With ~14 months of sample data the
+  model sees one BFCM peak; the seasonal index is correspondingly coarse. More
+  history sharpens it.
+- **Interval-summing approximation.** Aggregated P10/P90 bounds are summed across
+  the hierarchy (an additive approximation), so a parent interval is wider than a
+  strict joint-distribution interval would be. Medians are exact.
+- **Per-channel curves, not an MMM.** Cross-channel interactions (halo, cannibal-
+  ization) are intentionally not modelled.
+- **Microsoft Ads** is handled defensively (the brief mentions MS Ads) but the
+  committed model is trained on Google + Meta only; MS campaigns score from their
+  attributes/behaviour.
+
+---
+
+## Reproducibility
+
+- **Pinned dependencies** (`requirements.txt`) — installed & tested versions only.
+- **All randomness seeded** (NumPy, LightGBM; `deterministic=True`).
+- **No absolute paths** — relative paths / passed arguments only.
+- **The model is committed** under `pickle/` (3 MB, no Git LFS) and stores
+  LightGBM **model strings**, not Booster objects, for portability across patch
+  versions. Verified to unpickle in a clean virtualenv with the pinned versions.
+- `data/` is read **dynamically** (glob + column-signature detection); the code
+  assumes the **schema**, not the row count, and tolerates unseen campaigns.
+
+### Regenerate everything (offline dev)
+
+```bash
+python src/make_sample_data.py --out-dir ./data     # synthetic sample exports
+python src/train.py --data-dir ./data --out ./pickle/model.pkl
+python src/backtest.py --data-dir ./data            # validation report
+python -m pytest tests/ -q                          # smoke + contract tests
+```
+
+---
+
+## Open items to confirm (via Q&A)
+
+These are isolated and trivially changeable; they do not block the pipeline:
+
+1. **Exact `predictions.csv` schema** — column names/order, required granularities,
+   one file for all windows vs one run per window. (Edit `schema.py`.)
+2. **Scoring metric** — pinball loss / MAPE on P50 / coverage / a combination.
+3. **Future spend in the held-out set** — present (use it directly as
+   `budget_input`) or inferred (current trailing-extrapolation default).
+4. **Real dataset column names** — confirm they match `mapping.py` aliases.
