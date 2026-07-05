@@ -278,6 +278,23 @@ campaign stats in `data/`.
 
 ---
 
+## Troubleshooting
+
+| symptom | cause / fix |
+|---|---|
+| `run.sh: python not found` | Install Python 3.10–3.13 and ensure `python3` or `python` is on PATH. On Windows, disable the Microsoft Store python alias (run.sh skips it automatically if a real interpreter exists). |
+| `ModuleNotFoundError: lightgbm` (or pandas/pyarrow) | Run `pip install -r requirements.txt` in the active environment first. |
+| `Official file ... parsed to 0 rows` | Deliberate loud failure: an official-named CSV had unrecognizable columns. Check the file's header row matches the launch schema. |
+| `No CSV files found under ./data` | `data/` is empty — drop the campaign-stats CSVs in and rerun. |
+| Output file missing after a run | run.sh fails loudly *before* writing on any validation error — read the last error line; it names the exact contract violation. |
+| Permission denied on `./run.sh` | Use `bash run.sh ...` (equivalent) or `chmod +x run.sh`. |
+
+Verify the whole submission contract in one shot with
+`bash scripts/full_submission_test.sh` (runs the grader command twice and
+deep-validates the output).
+
+---
+
 ## Open items to confirm (via Q&A)
 
 These are isolated and trivially changeable; they do not block the pipeline:
