@@ -52,6 +52,7 @@ LONG_COLUMNS = [
     "spend",
     "conversions",
     "revenue",
+    "daily_budget",
 ]
 
 # ---------------------------------------------------------------------------
@@ -59,29 +60,54 @@ LONG_COLUMNS = [
 # Lets minor schema drift in the test set resolve without code changes.
 # ---------------------------------------------------------------------------
 _ALIASES = {
-    "date": ["date", "day", "reporting_starts", "reporting_date", "date_start"],
+    "date": [
+        "date",
+        "day",
+        # official AIgnition exports: Google API / Bing API / Meta API naming
+        "segments_date",       # google_ads_campaign_stats.csv
+        "timeperiod",          # bing_campaign_stats.csv (TimePeriod)
+        "time_period",
+        "date_start",          # meta_ads_campaign_stats.csv
+        "reporting_starts",
+        "reporting_date",
+    ],
     "campaign": ["campaign_name", "campaign", "campaignname"],
     "campaign_type": [
         "campaign_type",
+        "campaigntype",                        # Bing: CampaignType
+        "campaign_advertising_channel_type",   # Google API export
         "advertising_channel_type",
         "campaign_subtype",
         "objective",
     ],
     "adset": ["adset_name", "ad_set_name", "adgroup_name", "ad_group_name"],
-    "impressions": ["impressions", "impr"],
-    "clicks": ["clicks", "link_clicks", "all_clicks", "clicks_all"],
-    "spend": ["spend", "cost", "amount_spent", "amount_spent_usd", "cost_usd"],
+    "impressions": ["impressions", "metrics_impressions", "impr"],
+    "clicks": ["clicks", "metrics_clicks", "link_clicks", "all_clicks", "clicks_all"],
+    # NOTE: *_micros sources are auto-divided by 1e6 in ``to_long`` (see _MICROS).
+    "spend": [
+        "spend",
+        "metrics_cost_micros",  # Google API export — micro-currency units
+        "cost",
+        "cost_micros",
+        "amount_spent",
+        "amount_spent_usd",
+        "cost_usd",
+    ],
     "conversions": [
         "conversions",
+        "metrics_conversions",  # Google API export
         "purchases",
         "results",
         "website_purchases",
         "total_conversions",
         "all_conversions",
         "conv",
+        # DELIBERATELY EXCLUDED: meta's singular "conversion" column is
+        # value-like (revenue), NOT a count — see the revenue aliases.
     ],
     "revenue": [
         # Google UI exports say "Conv. value"; Meta says "Purchases conversion value".
+        "metrics_conversions_value",  # Google API export
         "conversion_value",
         "conv_value",
         "conv_val",
@@ -93,9 +119,21 @@ _ALIASES = {
         "revenue",
         "total_conversion_value",
         "website_purchases_conversion_value",
+        # LAST on purpose: meta's "conversion" column carries conversion VALUE
+        # (revenue-like), so it maps to revenue only when nothing better exists.
+        "conversion",
+    ],
+    "budget": [
+        "campaign_budget_amount",  # Google
+        "dailybudget",             # Bing: DailyBudget
+        "daily_budget",            # Meta
+        "budget",
     ],
     "channel": ["channel", "platform", "source", "publisher_platform"],
 }
+
+# Spend sources carrying micro-currency units (Google Ads API cost_micros).
+_MICROS_TOKEN = "micros"
 
 _BRAND_TOKENS = ("brand", "branded", "trademark")
 _DPA_TOKENS = ("dpa", "catalog", "advantage_catalog", "product_set", "asc")
@@ -139,6 +177,12 @@ _GOOGLE_TYPE_MAP = {
     "demand_gen": "DemandGen",
     "demandgen": "DemandGen",
     "discovery": "DemandGen",
+    # Microsoft/Bing-specific labels
+    "audience": "Display",
+    "hotel": "Other",
+    "smart": "Search",
+    "dynamicsearchads": "Search",
+    "dynamic_search": "Search",
 }
 
 
@@ -169,11 +213,35 @@ def normalize_channel(raw) -> str:
     return "other"
 
 
+def infer_channel_from_filename(path) -> str | None:
+    """Channel from the FILE NAME — the strongest signal for the official set.
+
+    google_ads_campaign_stats.csv -> google
+    bing_campaign_stats.csv       -> microsoft
+    meta_ads_campaign_stats.csv   -> meta
+    """
+    name = _norm(str(path).replace("\\", "/").rsplit("/", 1)[-1])
+    if "google" in name or "adwords" in name:
+        return "google"
+    if "bing" in name or "microsoft" in name or "msads" in name:
+        return "microsoft"
+    if "meta" in name or "facebook" in name or "instagram" in name:
+        return "meta"
+    return None
+
+
 def detect_channel(columns, explicit_value=None) -> str:
     """Best-effort channel from an explicit value or the column signature."""
     if explicit_value is not None:
         return normalize_channel(explicit_value)
     cols = {_norm(c) for c in columns}
+    # Official API-export signatures first (exact, unambiguous).
+    if any(c.startswith("metrics_") or c == "segments_date" for c in cols):
+        return "google"
+    if "timeperiod" in cols or "time_period" in cols:
+        return "microsoft"
+    if "date_start" in cols and ("cpm" in cols or "reach" in cols or "daily_budget" in cols):
+        return "meta"
     if any("purchase" in c for c in cols) or "adset_name" in cols or "ad_set_name" in cols:
         return "meta"
     if any("microsoft" in c or c == "bing" for c in cols):
@@ -219,12 +287,20 @@ def is_brand_campaign(campaign_name="", adset_name="") -> int:
     return int(any(tok in nb for tok in _BRAND_TOKENS))
 
 
+def has_revenue_column(columns) -> bool:
+    """True if this raw export carries any recognized revenue-like column."""
+    return _resolve(list(columns), "revenue") is not None
+
+
 def to_long(df_raw: pd.DataFrame, channel_hint=None) -> pd.DataFrame:
     """Map one raw platform export into the unified long schema.
 
     Tolerant of missing columns and unknown channels; fills safe defaults; never
     raises. Rows without a parseable date are dropped (they cannot be placed on
     the time axis).
+
+    ``channel_hint`` (e.g. from the file name) beats column-signature detection
+    but loses to an explicit per-row channel column.
     """
     if df_raw is None or len(df_raw) == 0:
         return pd.DataFrame(columns=LONG_COLUMNS)
@@ -267,7 +343,21 @@ def to_long(df_raw: pd.DataFrame, channel_hint=None) -> pd.DataFrame:
     for field in ("impressions", "clicks", "spend", "conversions", "revenue"):
         src = _resolve(cols, field)
         vals = pd.to_numeric(df_raw[src], errors="coerce") if src else 0.0
-        out[field] = np.clip(pd.Series(vals, index=df_raw.index).fillna(0.0), 0.0, None)
+        series = np.clip(pd.Series(vals, index=df_raw.index).fillna(0.0), 0.0, None)
+        # Google Ads API reports cost in micro-currency units -> real currency.
+        if field == "spend" and src is not None and _MICROS_TOKEN in _norm(src):
+            series = series / 1_000_000.0
+        out[field] = series
+
+    # Optional daily-budget attribute (carried for the product layer; the model
+    # derives its own budget_input from trailing spend).
+    bud_col = _resolve(cols, "budget")
+    if bud_col is not None:
+        out["daily_budget"] = np.clip(
+            pd.to_numeric(df_raw[bud_col], errors="coerce").fillna(0.0), 0.0, None
+        )
+    else:
+        out["daily_budget"] = 0.0
 
     out["campaign_type"] = [
         normalize_campaign_type(ch, rt, cn, an)

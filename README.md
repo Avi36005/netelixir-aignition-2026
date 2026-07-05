@@ -3,16 +3,17 @@
 **NetElixir AIgnition 3.0 · Team Kryptonite**
 
 A reproducible, offline forecasting core that predicts **probabilistic e-commerce
-revenue and ROAS** from Google Ads and Meta Ads exports, at the
+revenue and ROAS** from Google Ads, Microsoft/Bing Ads and Meta Ads exports, at the
 **blended / channel / campaign-type / campaign** levels over **30 / 60 / 90-day**
 windows. This repository is the **scored Track-1 core**: it runs end-to-end with
 **no network access**, loads a **committed, pre-trained model**, and writes a
 single `predictions.csv`.
 
-> The online product layer (FastAPI + React dashboard + LLM narratives) lives on
-> the *other side of a strict network wall* and is **not** in this repo — see
-> [Architecture](#architecture). The LLM is product-only by design, because the
-> scorer runs with the internet disabled.
+> The online product layer (FastAPI + React dashboard + LLM narratives) lives
+> behind a strict network wall under [`product/`](product/README.md) and imports
+> this same forecasting core, so the demo and the scored output never disagree on
+> the math. `run.sh` never installs or runs it. The LLM is product-only by design,
+> because the scorer runs with the internet disabled.
 
 ---
 
@@ -62,6 +63,27 @@ One file covers all three windows. Columns, in order:
 > granularities / one file vs one-per-window). It is defined in **one place** —
 > `src/forecasting/schema.py` — so matching the announced format is a one-line
 > edit. See [Open items](#open-items-to-confirm-via-qa).
+
+---
+
+
+## Official dataset support (ingestion)
+
+`data/` is parsed dynamically: every CSV is mapped by **filename channel
+inference** first, then column aliases, then column-signature detection. The
+three official AIgnition files are fully supported:
+
+| file | channel | date | spend | revenue | conversions |
+|---|---|---|---|---|---|
+| `google_ads_campaign_stats.csv` | `google` | `segments_date` | `metrics_cost_micros` **÷ 1,000,000** | `metrics_conversions_value` | `metrics_conversions` |
+| `bing_campaign_stats.csv` | `microsoft` | `TimePeriod` | `Spend` | `Revenue` | `Conversions` |
+| `meta_ads_campaign_stats.csv` | `meta` | `date_start` | `spend` | `conversion` (value-like → **revenue**) | none → **0** (never poisons count features) |
+
+Hard validation (`src/forecasting/ingest.py`) **fails loudly** when: an official
+file parses to 0 rows; > 5% of rows land in channel `other`; total revenue is 0
+while revenue columns exist; or a per-row spend suggests `cost_micros` was not
+divided. Unknown columns never crash the run; rows with invalid dates are
+dropped; all metrics are coerced to non-negative numerics.
 
 ---
 
@@ -127,9 +149,16 @@ it scores **brand-new campaigns** from their attributes + behaviour.
   → P10 / P50 / P90 directly.
 - **Quantile-crossing fix:** the three predictions are sorted row-wise so
   `P10 ≤ P50 ≤ P90` always.
-- **Calibrated intervals (a headline differentiator):** a time-based split learns
-  a single interval-width multiplier so out-of-sample coverage targets ~80% — the
-  point forecast (P50) is never altered. Measured coverage is reported below.
+- **Skew-robust target:** quantile models are fitted on `log1p(revenue)` and
+  inverted with `expm1` — quantiles are invariant under monotone transforms, so
+  the P10/P50/P90 remain valid while heavy revenue skew stops dominating the fit.
+- **Ensemble P50:** Model A (LightGBM quantiles) is blended with Model B, a
+  **seasonal ROAS baseline** (trailing 28-day ROAS × planned spend × seasonal
+  index). The blend weight is selected by WAPE on a forward time-based
+  calibration split, defaulting LightGBM-heavy when the blend does not help.
+- **Calibrated intervals (a headline differentiator):** the same time-based split
+  learns a single interval-width multiplier so out-of-sample coverage targets
+  ~80% — the point forecast (P50) is never altered.
 - **Spend is a known input.** We forecast **revenue given a budget** and derive
   ROAS = revenue ÷ spend. ROAS is never modelled directly.
 
@@ -174,18 +203,21 @@ planned spend at that level.
 
 ## Validation
 
-A **time-based backtest** (`python src/backtest.py`) mimics the scorer: train on
-an earlier period, hold out the forward 30/60/90-day window, predict, and score
-against realized actuals. On the committed sample data:
+A **time-based backtest** (`python src/backtest.py --data-dir ./data`) mimics the
+scorer: train on an earlier period, hold out the forward 30/60/90-day window,
+predict, and score against realized actuals. On the official AIgnition dataset
+(Google + Bing + Meta, 25,562 rows, 109 campaigns, 2024-01-01 → 2026-06-05):
 
 | metric | result | notes |
 |---|---|---|
-| **Interval coverage** | **~82%** | fraction of actuals inside P10–P90 (target ~80%) — the credibility number |
-| **MAPE on P50** | **~9%** | interpretable median revenue accuracy |
-| **Pinball loss** | reported | the likely scoring metric for probabilistic output |
+| **Interval coverage** | **~92%** | fraction of actuals inside P10–P90 (target ~80%; conservative side) |
+| **WAPE on P50** | **~72%** | volume-weighted campaign-level revenue error over 30/60/90d holdout |
+| **Pinball P10/P50/P90** | 1,664 / 7,097 / 9,436 | the standard probabilistic scoring metric |
 
-Coverage is held near 80% across all three windows. (Exact numbers print when you
-run the backtest; they depend on the committed sample data.)
+The backtest also reports per-window and per-channel coverage/WAPE/MAPE, parsed
+per-channel spend/revenue totals, campaign counts and the date range. MAPE is
+reported but dominated by near-zero-revenue campaigns; WAPE is the honest
+aggregate number.
 
 ---
 
@@ -199,7 +231,7 @@ run the backtest; they depend on the committed sample data.)
   set provides one — a one-line switch).
 - **Existing platform attribution is the source of truth**, used as-is. No custom
   attribution engine.
-- **Blended total = simple sum** across Google + Meta. Google/Meta attribution
+- **Blended total = simple sum** across Google + Microsoft + Meta. Cross-platform attribution
   overlap (a conversion can be claimed by both) is **acknowledged, not
   deduplicated** — deduplication would require an attribution model, which is out
   of scope.
@@ -215,9 +247,9 @@ run the backtest; they depend on the committed sample data.)
   strict joint-distribution interval would be. Medians are exact.
 - **Per-channel curves, not an MMM.** Cross-channel interactions (halo, cannibal-
   ization) are intentionally not modelled.
-- **Microsoft Ads** is handled defensively (the brief mentions MS Ads) but the
-  committed model is trained on Google + Meta only; MS campaigns score from their
-  attributes/behaviour.
+- **Meta conversion counts are unavailable** in the official export (its
+  `conversion` column is value-like and mapped to revenue), so meta CVR features
+  fall back to safe defaults.
 
 ---
 
@@ -235,11 +267,14 @@ run the backtest; they depend on the committed sample data.)
 ### Regenerate everything (offline dev)
 
 ```bash
-python src/make_sample_data.py --out-dir ./data     # synthetic sample exports
-python src/train.py --data-dir ./data --out ./pickle/model.pkl
-python src/backtest.py --data-dir ./data            # validation report
-python -m pytest tests/ -q                          # smoke + contract tests
+python src/train.py --data-dir ./data --out ./pickle/model.pkl   # retrain
+python src/backtest.py --data-dir ./data                         # validation report
+python src/report.py --predictions ./output/predictions.csv        --out ./output/report.html                                # visual range-bar report
+python -m pytest tests/ -q                                       # smoke + contract tests
 ```
+
+The committed `pickle/model.pkl` is trained on the official Google + Bing + Meta
+campaign stats in `data/`.
 
 ---
 
@@ -252,4 +287,5 @@ These are isolated and trivially changeable; they do not block the pipeline:
 2. **Scoring metric** — pinball loss / MAPE on P50 / coverage / a combination.
 3. **Future spend in the held-out set** — present (use it directly as
    `budget_input`) or inferred (current trailing-extrapolation default).
-4. **Real dataset column names** — confirm they match `mapping.py` aliases.
+4. ~~Real dataset column names~~ — **confirmed**: the official Google/Bing/Meta
+   exports are parsed natively (see *Official dataset support*).

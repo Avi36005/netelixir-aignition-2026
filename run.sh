@@ -12,13 +12,17 @@ DATA_DIR="${1:-./data}"
 MODEL_PATH="${2:-./pickle/model.pkl}"
 OUTPUT_PATH="${3:-./output/predictions.csv}"
 
-# Pick an available interpreter — grader environments vary.
-if command -v python3 >/dev/null 2>&1; then
-  PY=python3
-elif command -v python >/dev/null 2>&1; then
-  PY=python
-else
-  echo "ERROR: no python interpreter found on PATH" >&2
+# Pick an available interpreter — grader environments vary. A candidate must
+# actually EXECUTE (Windows ships a fake "python3" Store stub that fails).
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
+done
+if [ -z "$PY" ]; then
+  echo "ERROR: no working python interpreter found on PATH" >&2
   exit 1
 fi
 

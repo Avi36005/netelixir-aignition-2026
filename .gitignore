@@ -22,3 +22,7 @@ output/
 # (the grading pipeline cannot pull LFS objects).
 !pickle/
 !pickle/model.pkl
+
+# Frontend build artifacts (product layer)
+node_modules/
+product/frontend/dist/

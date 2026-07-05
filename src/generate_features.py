@@ -9,39 +9,12 @@ different row count and unseen campaigns. Writes an intermediate parquet that
 from __future__ import annotations
 
 import argparse
-import glob
 import os
 import sys
 
-import pandas as pd
-
 # Make ``forecasting`` importable regardless of the caller's CWD.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from forecasting import features, mapping  # noqa: E402
-
-
-def load_long(data_dir: str) -> pd.DataFrame:
-    paths = sorted(glob.glob(os.path.join(data_dir, "**", "*.csv"), recursive=True))
-    if not paths:  # also accept compressed exports
-        paths = sorted(glob.glob(os.path.join(data_dir, "**", "*.csv*"), recursive=True))
-    if not paths:
-        raise FileNotFoundError(f"No CSV files found under {data_dir!r}")
-
-    longs = []
-    for path in paths:
-        try:
-            raw = pd.read_csv(path)
-        except Exception as exc:  # a junk file must not abort the run
-            print(f"[generate_features] WARN: skipping {path}: {exc}", file=sys.stderr)
-            continue
-        if raw is None or raw.empty:
-            continue
-        longs.append(mapping.to_long(raw))
-
-    longs = [df for df in longs if len(df)]
-    if not longs:
-        raise ValueError(f"No usable rows parsed from any CSV under {data_dir!r}")
-    return pd.concat(longs, ignore_index=True)
+from forecasting import features, ingest  # noqa: E402
 
 
 def main(argv=None):
@@ -50,7 +23,8 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
-    long_df = load_long(args.data_dir)
+    long_df = ingest.load_long(args.data_dir, strict=True)
+    print("[generate_features] parsed:\n" + ingest.summarize(long_df))
     table = features.build_prediction_table(long_df)
 
     out_dir = os.path.dirname(os.path.abspath(args.out))

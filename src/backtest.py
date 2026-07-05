@@ -16,7 +16,6 @@ Run: ``python src/backtest.py --data-dir ./data``
 from __future__ import annotations
 
 import argparse
-import glob
 import os
 import random
 import sys
@@ -25,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from forecasting import curves, features, mapping  # noqa: E402
+from forecasting import curves, features, ingest  # noqa: E402
 from forecasting import model as model_mod  # noqa: E402
 
 WINDOWS = (30, 60, 90)
@@ -37,10 +36,6 @@ def _set_seeds(seed):
     np.random.seed(seed)
 
 
-def _load_long(data_dir):
-    paths = sorted(glob.glob(os.path.join(data_dir, "**", "*.csv"), recursive=True))
-    longs = [mapping.to_long(pd.read_csv(p)) for p in paths if os.path.getsize(p) > 0]
-    return pd.concat([d for d in longs if len(d)], ignore_index=True)
 
 
 def _pinball(actual, pred, alpha):
@@ -75,7 +70,7 @@ def _actuals_after(long_df, origin, windows):
 
 def run(data_dir, seed=42, holdout=max(WINDOWS)):
     _set_seeds(seed)
-    long_df = _load_long(data_dir)
+    long_df = ingest.load_long(data_dir, strict=True)
     long_df["date"] = pd.to_datetime(long_df["date"])
     gmax = long_df["date"].max()
     origin = gmax - pd.Timedelta(days=holdout)  # forecast origin for the holdout
@@ -100,38 +95,51 @@ def run(data_dir, seed=42, holdout=max(WINDOWS)):
         print("[backtest] no overlapping holdout rows — extend the data span.")
         return {}
 
-    a = merged["actual_revenue"].to_numpy()
-    p10 = merged["revenue_p10"].to_numpy()
-    p50 = merged["revenue_p50"].to_numpy()
-    p90 = merged["revenue_p90"].to_numpy()
+    def _metrics(sub):
+        aw = sub["actual_revenue"].to_numpy()
+        q10, q50, q90 = (sub[f"revenue_p{q}"].to_numpy() for q in (10, 50, 90))
+        cov = float(np.mean((aw >= q10) & (aw <= q90)))
+        wape = float(np.sum(np.abs(aw - q50)) / np.sum(np.abs(aw))) if np.sum(np.abs(aw)) > 0 else float("nan")
+        nz = aw > 0
+        mp = float(np.mean(np.abs((aw[nz] - q50[nz]) / aw[nz]))) if nz.any() else float("nan")
+        pb = {al: _pinball(aw, q, al) for q, al in ((q10, 0.1), (q50, 0.5), (q90, 0.9))}
+        return cov, wape, mp, pb
 
-    coverage = float(np.mean((a >= p10) & (a <= p90)))
-    nonzero = a > 0
-    mape = float(np.mean(np.abs((a[nonzero] - p50[nonzero]) / a[nonzero]))) if nonzero.any() else float("nan")
-    pinball = float(np.mean([_pinball(a, q, al) for q, al in
-                             ((p10, 0.1), (p50, 0.5), (p90, 0.9))]))
+    coverage, wape, mape, pinball = _metrics(merged)
 
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 70)
     print("  ROAScast backtest  (time-based, mimics the scorer)")
-    print("=" * 64)
+    print("=" * 70)
+    print("  parsed data:")
+    for line in ingest.summarize(long_df).splitlines():
+        print("   " + line)
+    print("-" * 70)
     print(f"  holdout origin      : {origin.date()}  (last {holdout}d held out)")
     print(f"  scored entities     : {len(merged)} campaign x window rows")
-    print("-" * 64)
+    print(f"  blend weight (GBM)  : {getattr(model, 'blend_weight_', 1.0):.2f}   "
+          f"| interval factor: {getattr(model, 'calib_factor_', 1.0):.2f}")
+    print("-" * 70)
     print(f"  INTERVAL COVERAGE   : {coverage:6.1%}   (target ~80% inside P10-P90)")
-    print(f"  MAPE on P50         : {mape:6.1%}   (median revenue accuracy)")
-    print(f"  Pinball loss (mean) : {pinball:12,.1f} (lower is better)")
-    print("-" * 64)
+    print(f"  WAPE on P50         : {wape:6.1%}   (volume-weighted revenue error)")
+    print(f"  MAPE on P50         : {mape:6.1%}   (rows with actual revenue > 0)")
+    print(f"  Pinball P10/P50/P90 : {pinball[0.1]:,.1f} / {pinball[0.5]:,.1f} / {pinball[0.9]:,.1f}")
+    print(f"  Pinball loss (mean) : {np.mean(list(pinball.values())):,.1f} (lower is better)")
+    print("-" * 70)
+    print("  by window:")
     for w in WINDOWS:
         sub = merged[merged["window_days"] == w]
         if sub.empty:
             continue
-        aw = sub["actual_revenue"].to_numpy()
-        cov = float(np.mean((aw >= sub["revenue_p10"]) & (aw <= sub["revenue_p90"])))
-        nz = aw > 0
-        mp = float(np.mean(np.abs((aw[nz] - sub["revenue_p50"].to_numpy()[nz]) / aw[nz]))) if nz.any() else float("nan")
-        print(f"  {w:>2}-day window      : coverage {cov:5.1%}  | MAPE(P50) {mp:5.1%}  | n={len(sub)}")
-    print("=" * 64 + "\n")
-    return {"coverage": coverage, "mape_p50": mape, "pinball": pinball, "n": len(merged)}
+        cov, wp, mp, _ = _metrics(sub)
+        print(f"   {w:>2}d : coverage {cov:6.1%} | WAPE {wp:6.1%} | MAPE {mp:6.1%} | n={len(sub)}")
+    print("  by channel:")
+    for ch in sorted(merged["channel"].unique()):
+        sub = merged[merged["channel"] == ch]
+        cov, wp, mp, _ = _metrics(sub)
+        print(f"   {ch:<10} : coverage {cov:6.1%} | WAPE {wp:6.1%} | MAPE {mp:6.1%} | n={len(sub)}")
+    print("=" * 70 + "\n")
+    return {"coverage": coverage, "wape_p50": wape, "mape_p50": mape,
+            "pinball": pinball, "n": len(merged)}
 
 
 def main(argv=None):

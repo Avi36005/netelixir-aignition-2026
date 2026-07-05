@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: light; }
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, sans-serif;
+  background: #fafafa;
+  color: #0a0a0a;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Black & white agency aesthetic — sharp, dollar-denominated, no clutter. */
+@layer components {
+  .card { @apply bg-white border border-neutral-200 rounded-lg p-5; }
+  .metric { @apply text-3xl font-semibold tracking-tight; }
+  .label { @apply text-xs uppercase tracking-wide text-neutral-500 font-medium; }
+  .btn { @apply px-4 py-2 rounded-md bg-neutral-900 text-white text-sm font-medium
+          hover:bg-neutral-700 disabled:opacity-40 disabled:cursor-not-allowed transition; }
+  .btn-ghost { @apply px-3 py-2 rounded-md text-sm font-medium text-neutral-600
+          hover:bg-neutral-100 transition; }
+  .tab { @apply px-4 py-2 text-sm font-medium rounded-md cursor-pointer transition; }
+  .tab-active { @apply bg-neutral-900 text-white; }
+  .tab-idle { @apply text-neutral-500 hover:bg-neutral-100; }
+}

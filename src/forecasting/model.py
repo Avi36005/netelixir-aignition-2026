@@ -36,6 +36,9 @@ class ForecastModel:
         self.booster_strings_ = {}  # {alpha: model_to_string()}
         self.fallback_ = {}
         self.calib_factor_ = 1.0  # interval-width multiplier around P50 (1.0 = none)
+        self.blend_weight_ = 1.0  # P50 = w*LightGBM + (1-w)*seasonal-ROAS baseline
+        self.log_target_ = True   # fit quantiles on log1p(revenue) (skew-robust);
+        # quantiles are invariant under monotone transforms, so expm1 restores $
         self.target_coverage_ = 0.8
         self.version = MODEL_VERSION
         self._booster_cache = {}
@@ -84,15 +87,16 @@ class ForecastModel:
         if params:
             base.update(params)
 
-        self.calib_factor_ = self._calibrate(
+        self.blend_weight_, self.calib_factor_ = self._calibrate(
             x, y, raw_calib, base, target_coverage
         )
 
         # Final models: fit on ALL the data (use every sample we have).
         self.booster_strings_ = {}
+        y_fit = np.log1p(np.clip(y, 0.0, None)) if self.log_target_ else y
         for alpha in QUANTILES:
             reg = lgb.LGBMRegressor(objective="quantile", alpha=alpha, **base)
-            reg.fit(x, y)
+            reg.fit(x, y_fit)
             self.booster_strings_[alpha] = reg.booster_.model_to_string()
 
         budget = np.clip(raw_df["budget_input"].to_numpy(dtype=float), 1e-9, None)
@@ -102,42 +106,66 @@ class ForecastModel:
         self._booster_cache = {}
         return self
 
+    def _baseline_p50(self, raw_df) -> np.ndarray:
+        """Model B — seasonal ROAS baseline: trailing 28d ROAS x planned spend x
+        seasonal index. Purely arithmetic, extremely robust; used only to blend
+        the P50 point forecast."""
+        df = raw_df
+        seas = F._window_seasonal(df, self.seasonal_index_)
+        roas = df["tr28_roas"].to_numpy(dtype=float)
+        roas14 = df["tr14_roas"].to_numpy(dtype=float)
+        roas = np.where(roas > 0, roas, roas14)
+        budget = np.clip(df["budget_input"].to_numpy(dtype=float), 0.0, None)
+        return np.clip(roas * budget * seas, 0.0, None)
+
     def _calibrate(self, x, y, raw_calib, base, target_coverage):
-        """Width multiplier ``f`` (around P50) that hits ~target coverage.
+        """Learn ``(blend_weight, width_factor)`` on a forward time split.
 
-        We split the training rows by time (earliest 80% fit / latest 20%
-        calibrate — the recent slice is the best proxy for the forecast horizon),
-        fit on the realized-budget design matrix, then evaluate on the
-        extrapolated-budget calibration rows and binary-search the single factor
-        ``f`` so that ~target_coverage of actuals fall inside the scaled interval.
+        Earliest 80% of windows fit / latest 20% calibrate — the recent slice is
+        the best proxy for the true forecast horizon.
 
-        ``f`` scales each side's distance from the median (``f=1`` leaves the
-        interval untouched). Coverage is monotone in ``f``, so the search is
-        stable — unlike a normalized-conformal score whose near-zero denominator
-        can explode. Returns ``1.0`` (no change) when data is too thin.
+        1. blend_weight w: P50 = w*GBM + (1-w)*seasonal-ROAS baseline, chosen by
+           WAPE on the calibration slice from a small LightGBM-heavy grid (ties
+           go to the higher w, and the default when data is thin is pure GBM).
+        2. width_factor f: scales each side's distance from the blended P50 so
+           ~target_coverage of calibration actuals fall inside P10-P90. Coverage
+           is monotone in f, so a binary search is stable. The point forecast is
+           never altered by f.
         """
         if raw_calib is None or len(y) < 40:
-            return 1.0
+            return 1.0, 1.0
         ws = pd.to_datetime(raw_calib["window_start"]).astype("int64").to_numpy()
         cutoff = np.quantile(ws, 0.8)
         fit_mask = ws <= cutoff
         cal_mask = ~fit_mask
         if cal_mask.sum() < 10 or fit_mask.sum() < 20:
-            return 1.0
+            return 1.0, 1.0
 
+        y_fit = np.log1p(np.clip(y, 0.0, None)) if self.log_target_ else y
         regs = {
             a: lgb.LGBMRegressor(objective="quantile", alpha=a, **base).fit(
-                x[fit_mask], y[fit_mask]
+                x[fit_mask], y_fit[fit_mask]
             )
             for a in QUANTILES
         }
         xc, _ = F.build_design_matrix(raw_calib, self.seasonal_index_, self.feature_columns_)
         xc, yc = xc[cal_mask], y[cal_mask]
-        preds = np.sort(
-            np.clip(np.column_stack([regs[a].predict(xc) for a in QUANTILES]), 0.0, None),
-            axis=1,
-        )
+        preds = np.column_stack([regs[a].predict(xc) for a in QUANTILES])
+        if self.log_target_:
+            preds = np.expm1(preds)
+        preds = np.sort(np.clip(preds, 0.0, None), axis=1)
         lo, mid, hi = preds[:, 0], preds[:, 1], preds[:, 2]
+
+        # --- blend weight (LightGBM-heavy grid; ties -> higher w = more GBM) ---
+        baseline = self._baseline_p50(raw_calib.loc[cal_mask].reset_index(drop=True))
+        denom = float(np.sum(np.abs(yc))) or 1.0
+        best_w, best_wape = 1.0, float("inf")
+        for w in (1.0, 0.85, 0.7, 0.5):
+            wape = float(np.sum(np.abs(yc - (w * mid + (1.0 - w) * baseline)))) / denom
+            if wape < best_wape - 1e-9:  # strict improvement only
+                best_w, best_wape = w, wape
+        mid = best_w * mid + (1.0 - best_w) * baseline
+        lo, hi = np.minimum(lo, mid), np.maximum(hi, mid)
 
         def coverage(f):
             low = mid - f * (mid - lo)
@@ -146,7 +174,7 @@ class ForecastModel:
 
         f_hi = 8.0
         if coverage(f_hi) < target_coverage:
-            return f_hi
+            return best_w, f_hi
         f_lo = 1.0
         for _ in range(40):
             mid_f = 0.5 * (f_lo + f_hi)
@@ -154,7 +182,7 @@ class ForecastModel:
                 f_hi = mid_f
             else:
                 f_lo = mid_f
-        return float(f_hi)
+        return best_w, float(f_hi)
 
     # ------------------------------------------------------------- inference
     def _booster(self, alpha):
@@ -173,18 +201,27 @@ class ForecastModel:
         """
         x, _ = F.build_design_matrix(raw_df, self.seasonal_index_, self.feature_columns_)
         preds = np.column_stack([self._booster(a).predict(x) for a in QUANTILES])
+        if getattr(self, "log_target_", False):
+            preds = np.expm1(preds)
         preds = np.clip(preds, 0.0, None)
         preds = np.sort(preds, axis=1)  # fix quantile crossing row-wise
+        lo, mid, hi = preds[:, 0], preds[:, 1], preds[:, 2]
+
+        # P50 ensemble: blend the GBM with the seasonal-ROAS baseline using the
+        # backtest-selected weight (1.0 = pure GBM when the blend didn't help).
+        w = float(getattr(self, "blend_weight_", 1.0))
+        if w < 1.0 and "tr28_roas" in raw_df.columns:
+            mid = w * mid + (1.0 - w) * self._baseline_p50(raw_df)
+            lo, hi = np.minimum(lo, mid), np.maximum(hi, mid)
 
         # Interval calibration — scale each side's distance from P50 by the
         # learned multiplier (scale-free across the campaign-to-blended magnitude
         # range). The point forecast P50 is left untouched.
         f = getattr(self, "calib_factor_", 1.0)
         if f and f != 1.0:
-            lo, mid, hi = preds[:, 0], preds[:, 1], preds[:, 2]
             lo = mid - f * (mid - lo)
             hi = mid + f * (hi - mid)
-            preds = np.sort(np.clip(np.column_stack([lo, mid, hi]), 0.0, None), axis=1)
+        preds = np.sort(np.clip(np.column_stack([lo, mid, hi]), 0.0, None), axis=1)
 
         out = raw_df.copy()
         bad = ~np.isfinite(preds).all(axis=1)
