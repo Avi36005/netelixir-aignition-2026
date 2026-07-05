@@ -381,7 +381,9 @@ def _try_groq(ctx):
     return _parse_json_text(body["choices"][0]["message"]["content"])
 
 
-_OLLAMA_PREFERENCE = ("qwen3:14b", "qwen3:8b", "mistral-small3.2:24b",
+# NOTE: qwen3:14b deliberately excluded — too heavy for the JSON-contract
+# fallback role on this hardware; 8b answers faster and reliably.
+_OLLAMA_PREFERENCE = ("qwen3:8b", "mistral-small3.2:24b",
                       "mistral:7b", "llama3.2:3b")
 
 
