@@ -4,11 +4,15 @@ NEVER imported by run.sh / the scored pipeline. The forecasting engine produces
 every number; the LLM only EXPLAINS a compact structured JSON context.
 
 Provider order (first available wins):
-    1. OpenAI   (OPENAI_API_KEY)    — strong chat model, temperature 0
-    2. Gemini   (GEMINI_API_KEY)    — structured forecast explanation
-    3. Groq     (GROQ_API_KEY)      — fast Llama fallback
-    4. Ollama   (local server)      — qwen3:14b > qwen3:8b > mistral-small3.2
+    1. Ollama   (local server)      — qwen3:8b preferred; private, free, offline
+    2. OpenAI   (OPENAI_API_KEY)    — strong chat model, temperature 0
+    3. Gemini   (GEMINI_API_KEY)    — structured forecast explanation
+    4. Groq     (GROQ_API_KEY)      — fast Llama fallback
     5. Deterministic template       — no key, no network, always works
+
+The local LLM is NOT trained on the campaign dataset — the forecasting model
+is. The LLM is grounded at runtime with structured forecast outputs plus the
+guardrails below; it never generates forecast numbers.
 
 Anti-hallucination controls:
   * The LLM gets ONLY a compact JSON context (never raw files).
@@ -52,15 +56,17 @@ def _load_env():
 _load_env()
 
 SYSTEM_PROMPT = textwrap.dedent("""
-    You are ROAScast AI Analyst. You explain ecommerce revenue and ROAS
-    forecasts. You must only use the numbers provided in the JSON context. Do
-    not invent revenue, spend, ROAS, dates, campaigns, channels, budgets,
-    confidence scores, causes, or recommendations. If the provided context does
-    not contain enough evidence, say 'Not enough evidence in the provided
-    data.' Every numeric statement must be traceable to the input JSON. Do not
-    claim causality unless the data supports it. Use cautious language such as
-    'likely', 'may', or 'appears' when explaining drivers. Never mention
-    unsupported external market events.
+    You are ROAScast AI Media Planner. You explain ecommerce revenue and ROAS
+    forecasts using only the structured JSON context provided. You must not
+    invent revenue, ROAS, spend, budgets, campaign names, dates, confidence
+    scores, or causes. Every numeric claim must be copied from or directly
+    supported by the JSON context. If the data is insufficient, say: 'Not
+    enough evidence in the provided data.' Do not claim causality unless the
+    evidence is explicitly present. Use cautious language such as 'may',
+    'likely', 'appears', and 'based on the forecast output'. Never mention
+    external market events, competitor activity, inflation, platform algorithm
+    changes, or customer behavior unless present in the JSON context. Your
+    output must be valid JSON only.
 
     All money is USD. ROAS is a dimensionless multiple (write "4.2x", never
     dollars). Forecasts are P10/P50/P90 ranges over an aggregate window, never
@@ -70,12 +76,21 @@ SYSTEM_PROMPT = textwrap.dedent("""
       "risks":[{"risk":"...","evidence":["..."],"severity":"high|medium|low","recommended_action":"..."}],
       "budget_recommendations":[{"recommendation":"...","evidence":["..."],"expected_direction":"increase_revenue|protect_roas|reduce_risk|not_enough_evidence"}],
       "campaigns_to_watch":[{"campaign_or_group":"...","reason":"...","evidence":["..."]}],
+      "suggested_budget_shift":{"summary":"...","source_channel":"...|null","target_channel":"...|null","evidence":["..."],"confidence":"high|medium|low"},
       "limitations":["..."]
     }
 """).strip()
 
 _INSIGHT_KEYS = ("forecast_summary", "risks", "budget_recommendations",
-                 "campaigns_to_watch", "limitations")
+                 "campaigns_to_watch", "suggested_budget_shift", "limitations")
+
+# Deterministic / unsupported-causality language is rejected outright.
+_BANNED_PHRASES = (
+    "will definitely", "guaranteed", "certainly", "without a doubt",
+    "because of competitor", "competitor activity", "because of inflation",
+    "inflation", "algorithm update", "algorithm change",
+    "customers are changing behavior", "market crash",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -90,18 +105,24 @@ def build_context(forecast_rows: list[dict], drivers: list[dict],
                 if r["level"] == name and int(r["window_days"]) == window_days]
 
     blended = next(iter(_lvl("blended")), None)
+    channels = _lvl("channel")
     campaigns = sorted(_lvl("campaign"),
                        key=lambda r: -float(r.get("revenue_p50", 0)))[:8]
     return {
         "forecast_window_days": window_days,
         "blended": blended,
-        "channels": _lvl("channel"),
+        "channels": channels,
         "campaign_types": _lvl("campaign_type"),
         "top_campaigns": campaigns,
         "top_drivers": (drivers or [])[:6],
         "historical_summary": history,
         "validation_warnings": warnings or [],
         "budget_simulation": simulate,
+        # Explicit allow-lists — the validator rejects anything outside these.
+        "allowed_channels": sorted({str(r.get("channel", "")) for r in channels if r.get("channel")}),
+        "allowed_campaigns": sorted({str(r.get("campaign", "")) for r in campaigns if r.get("campaign")}),
+        "allowed_metrics": ["revenue_p10", "revenue_p50", "revenue_p90",
+                            "roas_p10", "roas_p50", "roas_p90", "spend", "budget"],
     }
 
 
@@ -161,20 +182,40 @@ def _text_grounded(text, allowed):
     return True
 
 
-def validate_insights(ins: dict, ctx: dict) -> dict | None:
-    """Drop ungrounded items; return None if the response is unusable."""
+def _clean_language(*texts) -> bool:
+    joined = " ".join(str(t).lower() for t in texts)
+    return not any(p in joined for p in _BANNED_PHRASES)
+
+
+def validate_insights(ins: dict, ctx: dict, log: list | None = None) -> dict | None:
+    """Drop ungrounded items; return None if the response is unusable.
+
+    ``log`` (optional list) collects human-readable rejection reasons so the
+    backend can report WHY a guardrail fired.
+    """
+    log = log if log is not None else []
     if not isinstance(ins, dict):
+        log.append("response is not a JSON object")
         return None
     allowed = _context_numbers(ctx)
     names = _context_names(ctx)
     out = {k: [] for k in _INSIGHT_KEYS}
+    out["suggested_budget_shift"] = None
 
     def _ok_item(item, text_fields):
         if not isinstance(item, dict):
+            log.append("dropped non-object item")
             return False
         if not item.get("evidence") or not isinstance(item["evidence"], list):
+            log.append("dropped item without evidence references")
             return False
-        return all(_text_grounded(item.get(f, ""), allowed) for f in text_fields)
+        if not _clean_language(*(item.get(f, "") for f in text_fields)):
+            log.append("dropped item with deterministic/unsupported-causality language")
+            return False
+        if not all(_text_grounded(item.get(f, ""), allowed) for f in text_fields):
+            log.append("dropped item citing a number not present in the context")
+            return False
+        return True
 
     for it in ins.get("forecast_summary") or []:
         if _ok_item(it, ("claim",)):
@@ -191,11 +232,23 @@ def validate_insights(ins: dict, ctx: dict) -> dict | None:
         ref = str(it.get("campaign_or_group", "")).strip().lower()
         if ref and (ref in names or any(ref in n or n in ref for n in names)):
             out["campaigns_to_watch"].append(it)
+    shift = ins.get("suggested_budget_shift")
+    if isinstance(shift, dict) and _ok_item(shift, ("summary",)):
+        ok_chan = True
+        for f in ("source_channel", "target_channel"):
+            v = shift.get(f)
+            if v and str(v).strip().lower() not in names:
+                log.append("dropped budget shift: unknown channel " + repr(v))
+                ok_chan = False
+        if ok_chan:
+            out["suggested_budget_shift"] = shift
+
     out["limitations"] = [str(x) for x in (ins.get("limitations") or [])
-                          if _text_grounded(x, allowed)]
+                          if _text_grounded(x, allowed) and _clean_language(x)]
 
     # Unusable if the core sections are empty — fall back to the template.
     if not out["forecast_summary"]:
+        log.append("no grounded forecast_summary claims survived validation")
         return None
     return out
 
@@ -271,11 +324,34 @@ def _template_insights(ctx: dict) -> dict:
             "severity": "low",
             "recommended_action": "Maintain current allocation; re-evaluate as data arrives.",
         })
+    shift = None
+    if len(chans) >= 2:
+        by_roas = sorted(chans, key=lambda c: float(c.get("roas_p50", 0)))
+        lo_c, hi_c = by_roas[0], by_roas[-1]
+        if lo_c["channel"] != hi_c["channel"]:
+            shift = {
+                "summary": ("Based on the forecast output, shifting incremental budget "
+                            "from " + lo_c["channel"].title() + " "
+                            "(" + format(float(lo_c.get("roas_p50", 0)), ".2f") + "x expected ROAS) toward "
+                            + hi_c["channel"].title() + " "
+                            "(" + format(float(hi_c.get("roas_p50", 0)), ".2f") + "x expected ROAS) may "
+                            "improve blended efficiency, subject to diminishing returns."),
+                "source_channel": lo_c["channel"],
+                "target_channel": hi_c["channel"],
+                "evidence": ["channels[" + lo_c["channel"] + "].roas_p50",
+                             "channels[" + hi_c["channel"] + "].roas_p50"],
+                "confidence": "medium",
+            }
     return {
         "forecast_summary": summary,
         "risks": risks,
         "budget_recommendations": recs,
         "campaigns_to_watch": watch,
+        "suggested_budget_shift": shift or {
+            "summary": "Not enough evidence in the provided data.",
+            "source_channel": None, "target_channel": None,
+            "evidence": ["channels"], "confidence": "low",
+        },
         "limitations": [
             "Forecast assumes budgets and attribution remain as observed in the input data.",
             "P10-P90 intervals are calibrated on historical backtests (~80% target coverage).",
@@ -298,6 +374,9 @@ def _render_narrative(ins: dict) -> str:
         parts.append("\n**Campaigns to Watch**")
         parts += [f"- {i['campaign_or_group']}: {i['reason']}"
                   for i in ins["campaigns_to_watch"]]
+    if ins.get("suggested_budget_shift"):
+        parts.append("\n**Suggested Budget Shift**")
+        parts.append("- " + str(ins["suggested_budget_shift"].get("summary", "")))
     if ins.get("limitations"):
         parts.append("\n**Limitations**")
         parts += [f"- {x}" for x in ins["limitations"]]
@@ -408,8 +487,10 @@ def _try_ollama(ctx):
     return _parse_json_text(body["message"]["content"])
 
 
-_PROVIDERS = (("openai", _try_openai), ("gemini", _try_gemini),
-              ("groq", _try_groq), ("ollama", _try_ollama))
+# Provider order by NAME (not function reference) so the chain is resolved at
+# call time — keeps the functions monkeypatchable in tests and lets a swapped
+# implementation take effect without rebuilding this tuple.
+_PROVIDERS = ("ollama", "openai", "gemini", "groq")
 
 
 # ---------------------------------------------------------------------------
@@ -422,17 +503,24 @@ def explain(ctx: dict) -> dict:
     response that fails parsing or grounding is discarded and the chain moves
     on, ending at the deterministic template.
     """
-    for name, fn in _PROVIDERS:
+    guardrail_log = []
+    for name in _PROVIDERS:
+        fn = globals()["_try_" + name]  # resolved now, so tests can patch it
         try:
             raw = fn(ctx)
-        except Exception:
+        except Exception as exc:
+            guardrail_log.append(name + ": provider error (" + type(exc).__name__ + ")")
             raw = None
         if raw is None:
             continue
-        ins = validate_insights(raw, ctx)
+        log = []
+        ins = validate_insights(raw, ctx, log)
         if ins is not None:
-            return {"narrative": _render_narrative(ins),
-                    "insights": ins, "provider": name}
+            return {"narrative": _render_narrative(ins), "insights": ins,
+                    "provider": name, "guardrail": "passed",
+                    "guardrail_log": log}
+        guardrail_log.append(name + ": rejected - " + "; ".join(log[:3]))
     ins = _template_insights(ctx)
     return {"narrative": _render_narrative(ins), "insights": ins,
-            "provider": "template"}
+            "provider": "template", "guardrail": "fallback",
+            "guardrail_log": guardrail_log}

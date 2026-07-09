@@ -13,7 +13,9 @@ env/
 
 # Run artifacts
 output/
+tmp_test_output/
 *.parquet
+*.log
 
 # OS
 .DS_Store

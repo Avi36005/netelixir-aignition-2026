@@ -1,6 +1,23 @@
-# ROAScast — Probabilistic Revenue & ROAS Forecasting (Scored Core)
+# ROAScast — Probabilistic Revenue & ROAS Forecasting
+
+![Python](https://img.shields.io/badge/python-3.10–3.13-black)
+![Offline scoring](https://img.shields.io/badge/scoring-100%25%20offline-black)
+![No LLM in run.sh](https://img.shields.io/badge/run.sh-no%20LLM%2C%20no%20network-black)
+![Deps](https://img.shields.io/badge/dependencies-pinned-black)
+![Model](https://img.shields.io/badge/model-LightGBM%20quantile%20%2B%20calibration-black)
+![Coverage](https://img.shields.io/badge/P10–P90%20coverage-~92%25-black)
 
 **NetElixir AIgnition 3.0 · Team Kryptonite**
+
+> **Judge command** (exactly as in the submission guide):
+> ```bash
+> ./run.sh ./data ./pickle/model.pkl ./output/predictions.csv
+> ```
+> Also works with no arguments (`./run.sh`) and via `bash run.sh …`. Verify the
+> whole grading contract in one shot with `bash scripts/full_submission_test.sh`.
+
+**The one-line story:** *forecast accuracy comes from the trained forecasting
+model; the LLM only explains the forecast — with guardrails.*
 
 A reproducible, offline forecasting core that predicts **probabilistic e-commerce
 revenue and ROAS** from Google Ads, Microsoft/Bing Ads and Meta Ads exports, at the
@@ -275,6 +292,48 @@ python -m pytest tests/ -q                                       # smoke + contr
 
 The committed `pickle/model.pkl` is trained on the official Google + Bing + Meta
 campaign stats in `data/`.
+
+---
+
+## AI Media Planner (product layer only — never in `run.sh`)
+
+> *“ROAScast separates prediction from reasoning. The trained forecasting model
+> generates calibrated P10/P50/P90 revenue and ROAS ranges. The AI Media
+> Planner, which can run locally through Ollama or through API providers, only
+> explains those outputs using strict guardrails. Every AI recommendation is
+> grounded in structured forecast evidence, and unsafe or unsupported responses
+> are automatically replaced by a deterministic fallback.”*
+
+**Core principle: the ML model predicts · the LLM explains · guardrails verify.**
+
+- The **forecasting model is trained on the campaign dataset**. The local LLM is
+  **not** — it is grounded at runtime with structured forecast outputs and
+  guardrails. The LLM never generates forecast numbers.
+- Provider order (first available wins):
+  **1. Ollama (local)** → 2. OpenAI → 3. Gemini → 4. Groq → **5. deterministic
+  rule-based fallback** (no key, no network — insights always render).
+- Guardrails: the LLM receives only a compact JSON context with explicit
+  `allowed_channels` / `allowed_campaigns` / `allowed_metrics`; temperature 0;
+  JSON-only responses; and a post-validator that rejects invented numbers,
+  unknown campaign/channel names, missing evidence references, deterministic
+  language (“will definitely”, “guaranteed”) and unsupported causality
+  (“because of competitors / inflation / algorithm changes”). Rejected
+  responses fall back to the rule-based generator, and the UI shows
+  **Guardrail: Passed / Fallback used**.
+- Tested in `tests/test_llm_guardrails.py` (invented numbers, fake campaigns,
+  unsupported causality, provider-chain failure, keyless fallback).
+
+**Optional local AI setup** (never required for scoring or the frontend):
+
+```bash
+ollama pull qwen3:8b               # default local analyst
+ollama pull llama3.2:3b            # lightweight fallback
+ollama pull mistral-small3.2:24b   # stronger instruction-following (optional)
+# then run the product backend (product/README.md)
+```
+
+No model is ever downloaded at runtime; if Ollama is absent the chain simply
+moves on to API keys, then to the deterministic fallback.
 
 ---
 

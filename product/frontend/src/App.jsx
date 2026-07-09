@@ -8,73 +8,66 @@ import Validation from './pages/Validation.jsx'
 
 const PAGES = [
   { id: 'upload', label: 'Upload' },
+  { id: 'validation', label: 'Validation' },
   { id: 'dashboard', label: 'Forecast' },
-  { id: 'simulator', label: 'Budget Simulator' },
   { id: 'breakdown', label: 'Channel Breakdown' },
+  { id: 'simulator', label: 'Budget Simulator' },
   { id: 'insights', label: 'AI Insights' },
-  { id: 'validation', label: 'Validation Report' },
 ]
 
 export default function App() {
   const [page, setPage] = useState('upload')
-  const [session, setSession] = useState(null) // { session_id, summary }
-
-  const gated = !session && page !== 'upload'
+  const [session, setSession] = useState(null) // { session_id, summary, mock? }
 
   return (
-    <div className="min-h-screen">
-      <header className="border-b border-neutral-200 bg-white sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto px-6 py-3 flex items-center gap-6">
-          <div className="font-bold text-lg tracking-tight">
+    <div className="min-h-screen bg-white text-black flex flex-col">
+      <header className="border-b border-neutral-200 bg-white">
+        <div className="px-6 py-3 flex items-center justify-between">
+          <div className="font-bold text-lg tracking-tight text-black">
             ROAS<span className="text-neutral-400">cast</span>
+            <span className="ml-3 text-xs font-normal text-neutral-500">
+              Probabilistic revenue &amp; ROAS forecasting
+            </span>
           </div>
-          <nav className="flex gap-1 flex-wrap">
-            {PAGES.map((p) => (
-              <button
-                key={p.id}
-                disabled={!session && p.id !== 'upload'}
-                className={`tab ${page === p.id ? 'tab-active' : 'tab-idle'} disabled:opacity-30`}
-                onClick={() => setPage(p.id)}
-              >
-                {p.label}
-              </button>
-            ))}
-          </nav>
           {session && (
-            <div className="ml-auto text-xs text-neutral-400">
+            <div className="text-xs text-neutral-500">
               session {session.session_id}
+              {session.mock ? ' · demo data (backend offline)' : ''}
             </div>
           )}
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-6 py-8">
-        {gated ? (
-          <div className="card text-center text-neutral-500">
-            Upload your Google &amp; Meta CSVs first to run a forecast.
-          </div>
-        ) : (
-          <>
-            {page === 'upload' && (
-              <Upload
-                onReady={(s) => {
-                  setSession(s)
-                  setPage('dashboard')
-                }}
-              />
-            )}
-            {page === 'dashboard' && <Dashboard session={session} />}
-            {page === 'simulator' && <Simulator session={session} />}
-            {page === 'breakdown' && <Breakdown session={session} />}
-            {page === 'insights' && <Insights session={session} />}
-            {page === 'validation' && <Validation session={session} />}
-          </>
-        )}
-      </main>
+      <div className="flex flex-1">
+        <aside className="w-56 shrink-0 border-r border-neutral-200 bg-white p-3 space-y-1">
+          {PAGES.map((p) => (
+            <button
+              key={p.id}
+              disabled={!session && p.id !== 'upload'}
+              className={`nav-item ${page === p.id ? 'nav-active' : ''}`}
+              onClick={() => setPage(p.id)}
+            >
+              {p.label}
+            </button>
+          ))}
+        </aside>
 
-      <footer className="max-w-6xl mx-auto px-6 py-6 text-xs text-neutral-400">
-        Probabilistic revenue &amp; ROAS forecasts · all amounts USD · ROAS is a
-        dimensionless multiple · forecasts are 30/60/90-day window totals (never daily).
+        <main className="flex-1 px-8 py-8 max-w-5xl">
+          {page === 'upload' && (
+            <Upload onReady={(s) => { setSession(s); setPage('validation') }} />
+          )}
+          {page === 'validation' && session && <Validation session={session} />}
+          {page === 'dashboard' && session && <Dashboard session={session} />}
+          {page === 'breakdown' && session && <Breakdown session={session} />}
+          {page === 'simulator' && session && <Simulator session={session} />}
+          {page === 'insights' && session && <Insights session={session} />}
+        </main>
+      </div>
+
+      <footer className="border-t border-neutral-200 px-6 py-4 text-xs text-neutral-500">
+        All amounts USD · ROAS is a dimensionless multiple (e.g. 5.2x) · every
+        forecast is a 30/60/90-day window total (never daily) · P10 = low estimate,
+        P50 = expected, P90 = high estimate.
       </footer>
     </div>
   )
