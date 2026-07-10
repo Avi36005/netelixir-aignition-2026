@@ -78,10 +78,11 @@ def validate(req: ForecastRequest):
 def forecast(req: ForecastRequest):
     """Windows + optional budget override -> full reconciled hierarchy."""
     long_df = _get_long(req.session_id)
-    df = SERVICE.forecast(long_df, budget_overrides=req.budget_overrides)
+    df, guard = SERVICE.forecast_with_guard(long_df, budget_overrides=req.budget_overrides)
     if req.windows:
         df = df[df["window_days"].astype(int).isin(req.windows)]
     return {"currency": "USD", "model_version": SERVICE.version,
+            "scale_guard": guard,
             "rows": df.to_dict(orient="records")}
 
 
@@ -98,10 +99,14 @@ def simulate(req: SimulateRequest):
 def explain_endpoint(req: ExplainRequest):
     """Forecast + drivers -> grounded LLM causal narrative (3 sections)."""
     long_df = _get_long(req.session_id)
-    df = SERVICE.forecast(long_df, budget_overrides=req.budget_overrides)
+    df, guard = SERVICE.forecast_with_guard(long_df, budget_overrides=req.budget_overrides)
     rows = df.to_dict(orient="records")
     drivers = SERVICE.drivers()
-    ctx = build_context(rows, drivers, req.window_days)
+    warnings = list(guard.get("reasons", [])) if guard else []
+    if guard and guard.get("warning"):
+        warnings.append(guard["warning"])
+    ctx = build_context(rows, drivers, req.window_days, warnings=warnings)
     result = explain(ctx)
     result["drivers"] = drivers
+    result["scale_guard"] = guard
     return result

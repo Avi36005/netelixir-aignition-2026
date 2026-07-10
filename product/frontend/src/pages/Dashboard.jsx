@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, fmtUSD, fmtUSDc, fmtROAS } from '../lib/api.js'
+import { confidenceOf, ConfidenceBadge, EmptyState, isSessionExpired } from '../lib/charts.jsx'
 
 const WINDOWS = [30, 60, 90]
 
@@ -32,16 +33,17 @@ function RangeBar({ p10, p50, p90, max }) {
   )
 }
 
-export default function Dashboard({ session }) {
+export default function Dashboard({ session, onExpired }) {
   const [win, setWin] = useState(30)
   const [rows, setRows] = useState(null)
+  const [guard, setGuard] = useState(null)
   const [err, setErr] = useState(null)
 
   useEffect(() => {
     setRows(null)
     api.forecast(session.session_id, null)
-      .then((r) => setRows(r.rows))
-      .catch((e) => setErr(e.message))
+      .then((r) => { setRows(r.rows || []); setGuard(r.scale_guard || null) })
+      .catch((e) => (isSessionExpired(e) ? onExpired?.() : setErr(e.message)))
   }, [session.session_id])
 
   const view = useMemo(() => {
@@ -58,11 +60,31 @@ export default function Dashboard({ session }) {
   if (!view) return <div className="card text-neutral-400">Forecasting…</div>
 
   const { blended, channels } = view
-  const conf = confidence(blended)
+  if (!blended && channels.length === 0) {
+    return (
+      <EmptyState message="No forecast rows returned. Upload data with enough history and try again." />
+    )
+  }
+  // The backend's OOD scale guard overrides the interval-width heuristic:
+  // it knows whether the data sits inside the training distribution.
+  const conf = guard && guard.fallback_used
+    ? { label: guard.confidence,
+        note: `out-of-distribution scale (OOD score ${Number(guard.ood_score).toFixed(2)})` }
+    : confidence(blended)
   const maxRev = Math.max(...channels.map((c) => c.revenue_p90), 1)
 
   return (
     <div className="space-y-6">
+      {guard?.warning && (
+        <div className="card border-amber-300 bg-amber-50 text-amber-900 text-sm">
+          <span className="font-medium">Scale mismatch — low confidence. </span>
+          {guard.warning}
+          <span className="text-amber-700">
+            {' '}(model weight {Math.round(guard.model_weight * 100)}%, baseline
+            weight {Math.round(guard.baseline_weight * 100)}%)
+          </span>
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Forecast dashboard</h1>
         <div className="flex gap-1 border border-neutral-200 p-1 rounded-md">
@@ -80,12 +102,12 @@ export default function Dashboard({ session }) {
           sub={`${win}-day window total`} />
         <Card label="Revenue range (P10–P90)"
           value={`${fmtUSDc(blended?.revenue_p10)} – ${fmtUSDc(blended?.revenue_p90)}`}
-          sub="low estimate – high estimate" small />
+          sub="P10 low estimate – P90 high estimate" small />
         <Card label="Expected ROAS (P50)" value={fmtROAS(blended?.roas_p50)}
           sub="revenue ÷ planned spend" />
         <Card label="ROAS range (P10–P90)"
           value={`${fmtROAS(blended?.roas_p10)} – ${fmtROAS(blended?.roas_p90)}`}
-          sub="low estimate – high estimate" small />
+          sub="P10 low estimate – P90 high estimate" small />
         <Card label="Forecast confidence" value={conf.label} sub={conf.note} />
       </div>
 
@@ -112,6 +134,40 @@ export default function Dashboard({ session }) {
         <p className="text-xs text-neutral-500 mt-4">
           Aggregate {win}-day window totals — never daily forecasts.
         </p>
+      </div>
+
+      <div className="card">
+        <div className="label mb-3">Confidence by channel</div>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-neutral-500 border-b border-neutral-200 text-xs uppercase">
+              <th className="py-2">Channel</th>
+              <th>Confidence</th>
+              <th className="text-right">Expected revenue (P50)</th>
+              <th className="text-right">Expected ROAS (P50)</th>
+              <th>Basis</th>
+            </tr>
+          </thead>
+          <tbody>
+            {channels.map((c) => {
+              const level = guard?.fallback_used && guard.confidence === 'Low'
+                ? 'Low' : confidenceOf(c)
+              return (
+                <tr key={c.channel} className="border-b border-neutral-100">
+                  <td className="py-2 capitalize font-medium">{c.channel}</td>
+                  <td><ConfidenceBadge level={level} /></td>
+                  <td className="text-right tabular-nums">{fmtUSD(c.revenue_p50)}</td>
+                  <td className="text-right tabular-nums">{fmtROAS(c.roas_p50)}</td>
+                  <td className="text-neutral-500 text-xs">
+                    {guard?.fallback_used && guard.confidence === 'Low'
+                      ? 'OOD scale mismatch — baseline-blended forecast'
+                      : 'relative width of the P10–P90 interval'}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   )

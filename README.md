@@ -268,6 +268,37 @@ aggregate number.
   `conversion` column is value-like and mapped to revenue), so meta CVR features
   fall back to safe defaults.
 
+### Out-of-distribution scale guardrail
+
+ROAScast includes an out-of-distribution scale guardrail. When uploaded data is
+far outside the scale of the training data, the system lowers confidence and
+blends the ML forecast with a historical ROAS baseline. This prevents the model
+from over-trusting raw revenue predictions on datasets that are much larger or
+structurally different from the official training data.
+
+How it works (`src/forecasting/scale_guard.py`, shared by `run.sh` and the
+product backend):
+
+1. **Training profile** — training-time distribution metadata (monthly and
+   per-campaign spend/revenue quantiles, ROAS range, channels, campaign types,
+   date range) is saved to `pickle/training_profile.json` next to the model.
+2. **OOD detection** — at predict time the uploaded data is compared against
+   that profile (scale ratios, ROAS range, unseen campaign types, unmapped
+   channels, and model-vs-trailing-baseline divergence) producing an
+   `ood_score` in [0, 1] and a High / Medium / Low confidence bucket.
+3. **Scale-safe blend** — High confidence uses the trained model unchanged
+   (official-scale output is bit-identical). Medium/Low blends the revenue
+   quantiles with a trailing-ROAS × planned-spend × seasonality baseline
+   (Medium: 60/40, Low: 25/75) and widens the P10–P90 interval by the OOD
+   score. ROAS is always derived as revenue ÷ planned spend afterwards, so
+   displayed ROAS stays consistent with revenue.
+4. **Transparency** — the guard's verdict, reasons, weights, and training-scale
+   comparison are printed by `predict.py`, written to `output/scale_report.json`,
+   surfaced in the product validation report and dashboard warning banner, and
+   `src/backtest.py` reports model-only vs baseline-only vs blended accuracy.
+   If the profile sidecar is missing, the guard is skipped (model used as-is)
+   and that is logged — old pickles keep working.
+
 ---
 
 ## Reproducibility

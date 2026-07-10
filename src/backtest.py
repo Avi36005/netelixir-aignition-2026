@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from forecasting import curves, features, ingest  # noqa: E402
+from forecasting import curves, features, ingest, scale_guard  # noqa: E402
 from forecasting import model as model_mod  # noqa: E402
 
 WINDOWS = (30, 60, 90)
@@ -87,6 +87,17 @@ def run(data_dir, seed=42, holdout=max(WINDOWS)):
     pred_table = features.build_prediction_table(train_long)
     pred = model.predict(pred_table)
 
+    # Guardrail comparison forecasts on the SAME rows: the trailing-ROAS
+    # baseline alone, and the Low-confidence blend the OOD guard would apply.
+    base_q = scale_guard.baseline_forecast(
+        pred_table, model.seasonal_index_,
+        model.fallback_.get("global_median_roas", 1.0))
+    wm, wb = scale_guard.BLEND_WEIGHTS["Low"]
+    for j, q in enumerate((10, 50, 90)):
+        pred[f"base_revenue_p{q}"] = base_q[:, j]
+        pred[f"blend_revenue_p{q}"] = (
+            wm * pred[f"revenue_p{q}"] + wb * base_q[:, j])
+
     actuals = _actuals_after(long_df, origin, WINDOWS)
     merged = pred.merge(actuals, on=["campaign", "window_days"], how="inner")
     # Use realized spend in the holdout as the budget the model "was given".
@@ -95,9 +106,9 @@ def run(data_dir, seed=42, holdout=max(WINDOWS)):
         print("[backtest] no overlapping holdout rows — extend the data span.")
         return {}
 
-    def _metrics(sub):
+    def _metrics(sub, prefix="revenue"):
         aw = sub["actual_revenue"].to_numpy()
-        q10, q50, q90 = (sub[f"revenue_p{q}"].to_numpy() for q in (10, 50, 90))
+        q10, q50, q90 = (sub[f"{prefix}_p{q}"].to_numpy() for q in (10, 50, 90))
         cov = float(np.mean((aw >= q10) & (aw <= q90)))
         wape = float(np.sum(np.abs(aw - q50)) / np.sum(np.abs(aw))) if np.sum(np.abs(aw)) > 0 else float("nan")
         nz = aw > 0
@@ -137,6 +148,14 @@ def run(data_dir, seed=42, holdout=max(WINDOWS)):
         sub = merged[merged["channel"] == ch]
         cov, wp, mp, _ = _metrics(sub)
         print(f"   {ch:<10} : coverage {cov:6.1%} | WAPE {wp:6.1%} | MAPE {mp:6.1%} | n={len(sub)}")
+    print("-" * 70)
+    print("  OOD guard comparison (same holdout rows; blend = Low-confidence "
+          f"weights {wm:.0%} model / {wb:.0%} baseline):")
+    for label, prefix in (("model only", "revenue"),
+                          ("baseline only", "base_revenue"),
+                          ("blended (Low)", "blend_revenue")):
+        cov, wp, mp, _ = _metrics(merged, prefix)
+        print(f"   {label:<14} : coverage {cov:6.1%} | WAPE {wp:6.1%} | MAPE {mp:6.1%}")
     print("=" * 70 + "\n")
     return {"coverage": coverage, "wape_p50": wape, "mape_p50": mape,
             "pinball": pinball, "n": len(merged)}

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, fmtUSD, fmtROAS } from '../lib/api.js'
+import { CompareBars, CompareLegend, EmptyState, isSessionExpired } from '../lib/charts.jsx'
 
-export default function Simulator({ session }) {
+export default function Simulator({ session, onExpired }) {
   const [baseline, setBaseline] = useState(null)   // { channel: currentBudget }
   const [baseSim, setBaseSim] = useState(null)     // simulate(baseline) result
   const [scenario, setScenario] = useState(null)
@@ -23,14 +24,15 @@ export default function Simulator({ session }) {
         setBaseSim(bs)
         setSim(bs)
       })
-      .catch((e) => setErr(e.message))
+      .catch((e) => (isSessionExpired(e) ? onExpired?.() : setErr(e.message)))
   }, [session.session_id])
 
   useEffect(() => {
     if (!scenario) return
     clearTimeout(timer.current)
     timer.current = setTimeout(() => {
-      api.simulate(session.session_id, scenario).then(setSim).catch((e) => setErr(e.message))
+      api.simulate(session.session_id, scenario).then(setSim)
+        .catch((e) => (isSessionExpired(e) ? onExpired?.() : setErr(e.message)))
     }, 150)
     return () => clearTimeout(timer.current)
   }, [scenario, session.session_id])
@@ -39,6 +41,11 @@ export default function Simulator({ session }) {
   if (!baseline || !sim) return <div className="card text-neutral-400">Loading…</div>
 
   const channels = Object.keys(baseline)
+  if (channels.length === 0) {
+    return (
+      <EmptyState message="No channel budgets available to simulate — the forecast returned no channel rows." />
+    )
+  }
   const dRev = baseSim ? sim.blended.revenue - baseSim.blended.revenue : 0
   const dRoas = baseSim ? sim.blended.roas - baseSim.blended.roas : 0
 
@@ -102,6 +109,27 @@ export default function Simulator({ session }) {
             <Stat label="Change in ROAS"
               value={(dRoas >= 0 ? '+' : '') + dRoas.toFixed(2) + 'x'} sub="vs current plan" />
           </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="flex items-center justify-between mb-4">
+          <div className="label">Current plan vs simulated scenario (30-day, blended)</div>
+          <CompareLegend />
+        </div>
+        <div className="grid md:grid-cols-3 gap-6">
+          <CompareBars label="Spend (USD)"
+            current={baseSim?.blended.budget ?? 0}
+            simulated={sim.blended.budget}
+            display={fmtUSD} />
+          <CompareBars label="Expected revenue (P50 basis)"
+            current={baseSim?.blended.revenue ?? 0}
+            simulated={sim.blended.revenue}
+            display={fmtUSD} />
+          <CompareBars label="Expected ROAS"
+            current={baseSim?.blended.roas ?? 0}
+            simulated={sim.blended.roas}
+            display={fmtROAS} />
         </div>
       </div>
 

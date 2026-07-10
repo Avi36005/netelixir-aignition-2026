@@ -19,6 +19,9 @@ export default function App() {
   const [page, setPage] = useState('upload')
   const [session, setSession] = useState(null) // { session_id, summary, mock? }
 
+  // Expired/unknown session (backend restarted) -> back to Upload.
+  const onExpired = () => { setSession(null); setPage('upload') }
+
   return (
     <div className="min-h-screen bg-white text-black flex flex-col">
       <header className="border-b border-neutral-200 bg-white">
@@ -56,11 +59,11 @@ export default function App() {
           {page === 'upload' && (
             <Upload onReady={(s) => { setSession(s); setPage('validation') }} />
           )}
-          {page === 'validation' && session && <Validation session={session} />}
-          {page === 'dashboard' && session && <Dashboard session={session} />}
-          {page === 'breakdown' && session && <Breakdown session={session} />}
-          {page === 'simulator' && session && <Simulator session={session} />}
-          {page === 'insights' && session && <Insights session={session} />}
+          {page === 'validation' && session && <Validation session={session} onExpired={onExpired} />}
+          {page === 'dashboard' && session && <Dashboard session={session} onExpired={onExpired} />}
+          {page === 'breakdown' && session && <Breakdown session={session} onExpired={onExpired} />}
+          {page === 'simulator' && session && <Simulator session={session} onExpired={onExpired} />}
+          {page === 'insights' && session && <Insights session={session} onExpired={onExpired} />}
         </main>
       </div>
 

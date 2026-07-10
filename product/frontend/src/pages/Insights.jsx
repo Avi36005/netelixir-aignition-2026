@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api.js'
+import { isSessionExpired } from '../lib/charts.jsx'
 
 const WINDOWS = [30, 60, 90]
 
@@ -23,7 +24,7 @@ function Items({ list, render, empty }) {
   )
 }
 
-export default function Insights({ session }) {
+export default function Insights({ session, onExpired }) {
   const [win, setWin] = useState(30)
   const [data, setData] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -34,7 +35,7 @@ export default function Insights({ session }) {
     setErr(null)
     api.explain(session.session_id, w)
       .then(setData)
-      .catch((e) => setErr(e.message))
+      .catch((e) => (isSessionExpired(e) ? onExpired?.() : setErr(e.message)))
       .finally(() => setBusy(false))
   }
 

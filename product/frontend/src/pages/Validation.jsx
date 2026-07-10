@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, fmtUSD } from '../lib/api.js'
+import { isSessionExpired } from '../lib/charts.jsx'
 
 function Badge({ status }) {
   const cls = status === 'Pass' ? 'badge badge-pass'
@@ -17,12 +18,13 @@ function CheckRow({ label, status, detail }) {
   )
 }
 
-export default function Validation({ session }) {
+export default function Validation({ session, onExpired }) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState(null)
 
   useEffect(() => {
-    api.validate(session.session_id).then(setData).catch((e) => setErr(e.message))
+    api.validate(session.session_id).then(setData)
+      .catch((e) => (isSessionExpired(e) ? onExpired?.() : setErr(e.message)))
   }, [session.session_id])
 
   if (err) return <div className="card">Error: {err}</div>
@@ -78,6 +80,62 @@ export default function Validation({ session }) {
           {errors} error(s), {warnings} warning(s)
         </span>
       </div>
+
+      {data.scale && (
+        <div className="card">
+          <div className="label mb-3">Training-scale comparison (OOD guard)</div>
+          <div className="flex items-center gap-3 mb-2">
+            <Badge status={data.scale.confidence === 'High' ? 'Pass'
+              : data.scale.confidence === 'Medium' ? 'Warning' : 'Error'} />
+            <span className="text-sm">
+              Forecast confidence: <b>{data.scale.confidence}</b>
+              {' '}· OOD score {Number(data.scale.ood_score).toFixed(2)}
+              {' '}· fallback {data.scale.fallback_used ? 'yes' : 'no'}
+              {' '}(model {Math.round(data.scale.model_weight * 100)}% /
+              baseline {Math.round(data.scale.baseline_weight * 100)}%)
+            </span>
+          </div>
+          {data.scale.warning && (
+            <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 mb-2">
+              {data.scale.warning}
+            </p>
+          )}
+          {data.scale.reasons?.length > 0 && (
+            <ul className="text-sm text-neutral-600 list-disc ml-5 space-y-1">
+              {data.scale.reasons.map((r, i) => <li key={i}>{r}</li>)}
+            </ul>
+          )}
+          {data.scale.comparison && (
+            <table className="w-full text-sm mt-3">
+              <thead>
+                <tr className="text-left text-neutral-500 border-b border-neutral-200 text-xs uppercase">
+                  <th className="py-2">Metric</th>
+                  <th className="text-right">Uploaded (median)</th>
+                  <th className="text-right">Training (median)</th>
+                  <th className="text-right">Ratio</th>
+                </tr>
+              </thead>
+              <tbody>
+                {['monthly_spend', 'monthly_revenue', 'campaign_monthly_spend',
+                  'campaign_monthly_revenue'].map((k) => {
+                  const c = data.scale.comparison[k]
+                  if (!c) return null
+                  return (
+                    <tr key={k} className="border-b border-neutral-100">
+                      <td className="py-2">{k.replaceAll('_', ' ')}</td>
+                      <td className="text-right">{fmtUSD(c.uploaded_p50)}</td>
+                      <td className="text-right">{fmtUSD(c.training_p50)}</td>
+                      <td className="text-right">
+                        {c.ratio_vs_training_median == null ? '—' : c.ratio_vs_training_median + 'x'}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       <div className="card overflow-x-auto">
         <div className="label mb-3">Checks</div>

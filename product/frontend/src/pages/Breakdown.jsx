@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, fmtUSD, fmtROAS, fmtPct } from '../lib/api.js'
+import { BarRow, EmptyState, isSessionExpired } from '../lib/charts.jsx'
 
 const WINDOWS = [30, 60, 90]
 
@@ -10,7 +11,7 @@ function riskOf(r) {
   return 'OK'
 }
 
-export default function Breakdown({ session }) {
+export default function Breakdown({ session, onExpired }) {
   const [win, setWin] = useState(30)
   const [q, setQ] = useState('')
   const [rows, setRows] = useState(null)
@@ -18,8 +19,8 @@ export default function Breakdown({ session }) {
 
   useEffect(() => {
     api.forecast(session.session_id, null)
-      .then((r) => setRows(r.rows))
-      .catch((e) => setErr(e.message))
+      .then((r) => setRows(r.rows || []))
+      .catch((e) => (isSessionExpired(e) ? onExpired?.() : setErr(e.message)))
   }, [session.session_id])
 
   const view = useMemo(() => {
@@ -48,6 +49,13 @@ export default function Breakdown({ session }) {
   if (err) return <div className="card">Error: {err}</div>
   if (!view) return <div className="card text-neutral-400">Loading…</div>
 
+  const channelRows = rows
+    .filter((x) => x.level === 'channel' && Number(x.window_days) === win)
+    .sort((a, b) => b.revenue_p50 - a.revenue_p50)
+  const maxRev = Math.max(...channelRows.map((c) => c.revenue_p50), 1e-9)
+  const maxRoas = Math.max(...channelRows.map((c) => c.roas_p50), 1e-9)
+  const chName = (c) => (c === 'microsoft' ? 'Microsoft/Bing' : c)
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between flex-wrap gap-3">
@@ -67,6 +75,39 @@ export default function Breakdown({ session }) {
           </div>
         </div>
       </div>
+
+      {channelRows.length === 0 ? (
+        <EmptyState message={`No channel-level forecast for the ${win}-day window.`} />
+      ) : (
+        <div className="grid md:grid-cols-2 gap-6">
+          <div className="card">
+            <div className="label mb-3">Forecast revenue by channel — expected (P50)</div>
+            <div className="space-y-3">
+              {channelRows.map((c) => (
+                <BarRow key={c.channel} label={chName(c.channel)}
+                  value={c.revenue_p50} max={maxRev}
+                  display={fmtUSD(c.revenue_p50)} tag="P50" />
+              ))}
+            </div>
+            <p className="text-xs text-neutral-500 mt-3">
+              {win}-day window totals in USD.
+            </p>
+          </div>
+          <div className="card">
+            <div className="label mb-3">Expected ROAS by channel (P50)</div>
+            <div className="space-y-3">
+              {channelRows.map((c) => (
+                <BarRow key={c.channel} label={chName(c.channel)}
+                  value={c.roas_p50} max={maxRoas}
+                  display={fmtROAS(c.roas_p50)} tag="P50" />
+              ))}
+            </div>
+            <p className="text-xs text-neutral-500 mt-3">
+              ROAS = forecast revenue ÷ planned spend (dimensionless multiple).
+            </p>
+          </div>
+        </div>
+      )}
 
       <div className="card overflow-x-auto">
         <table className="w-full text-sm">

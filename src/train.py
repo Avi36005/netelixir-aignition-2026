@@ -18,7 +18,7 @@ import joblib
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from forecasting import curves, features, ingest  # noqa: E402
+from forecasting import curves, features, ingest, scale_guard  # noqa: E402
 from forecasting import model as model_mod  # noqa: E402
 
 
@@ -49,9 +49,17 @@ def main(argv=None):
         raw, targets, seasonal, channel_curves, raw_calib=raw_ex, seed=args.seed
     )
 
+    # Training-distribution profile for the OOD scale guard: stored both on
+    # the model AND as a JSON sidecar next to the pickle (survives a pickle
+    # from an older class version).
+    profile = scale_guard.build_training_profile(long_df)
+    model.training_profile_ = profile
+
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir or ".", exist_ok=True)
     joblib.dump(model, args.out)
+    profile_path = scale_guard.save_profile(profile, args.out)
+    print(f"[train] training profile -> {profile_path}")
 
     print(
         f"[train] {len(raw)} samples ({raw['campaign'].nunique()} campaigns); "

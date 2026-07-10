@@ -25,7 +25,7 @@ _SRC = os.path.join(_REPO_ROOT, "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from forecasting import curves, features, mapping, reconcile, schema  # noqa: E402
+from forecasting import curves, features, mapping, reconcile, scale_guard, schema  # noqa: E402
 
 DEFAULT_MODEL_PATH = os.path.join(_REPO_ROOT, "pickle", "model.pkl")
 
@@ -39,6 +39,9 @@ class ForecastService:
         )
         self.model = joblib.load(self.model_path)
         self.version = getattr(self.model, "version", "unknown")
+        # Training-distribution profile for the OOD scale guard (sidecar JSON
+        # next to the pickle; None disables the guard rather than crashing).
+        self.training_profile = scale_guard.load_profile(self.model_path, self.model)
 
     # -- ingestion ----------------------------------------------------------
     @staticmethod
@@ -81,9 +84,9 @@ class ForecastService:
         }
 
     # -- validation (campaign consistency) ----------------------------------
-    @staticmethod
-    def validate(long_df: pd.DataFrame) -> dict:
-        """Campaign consistency report: mapping coverage, gaps, name drift."""
+    def validate(self, long_df: pd.DataFrame) -> dict:
+        """Campaign consistency report: mapping coverage, gaps, name drift,
+        plus the OOD scale assessment vs the training distribution."""
         issues: list[dict] = []
         if long_df is None or long_df.empty:
             return {"ok": False, "issues": [
@@ -128,9 +131,26 @@ class ForecastService:
                 "spend": float(cf["spend"].sum()),
                 "revenue": float(cf["revenue"].sum()),
             })
+        # 3) OOD scale assessment vs the training distribution
+        scale = None
+        if self.training_profile is not None:
+            up_profile = scale_guard.build_training_profile(d)
+            scale = scale_guard.assess(up_profile, self.training_profile)
+            w_model, w_base = scale_guard.BLEND_WEIGHTS.get(
+                scale["confidence"], (1.0, 0.0))
+            scale["fallback_used"] = w_base > 0.0
+            scale["model_weight"] = w_model
+            scale["baseline_weight"] = w_base
+            if scale["confidence"] == "Low":
+                scale["warning"] = scale_guard.OOD_WARNING
+            for reason in scale["reasons"]:
+                issues.append({"severity": "warning", "code": "scale_mismatch",
+                               "message": reason})
+
         has_error = any(i["severity"] == "error" for i in issues)
         return {"ok": not has_error, "issues": issues,
-                "campaigns": sorted(rows, key=lambda r: -r["spend"])}
+                "campaigns": sorted(rows, key=lambda r: -r["spend"]),
+                "scale": scale}
 
     # -- forecast -----------------------------------------------------------
     def forecast(self, long_df: pd.DataFrame,
@@ -141,12 +161,32 @@ class ForecastService:
         scales each channel's per-window budget_input proportionally so the user
         can ask "what if I spend $X on Meta".
         """
+        df, _ = self.forecast_with_guard(long_df, budget_overrides)
+        return df
+
+    def forecast_with_guard(self, long_df: pd.DataFrame,
+                            budget_overrides: dict | None = None
+                            ) -> tuple[pd.DataFrame, dict | None]:
+        """Forecast plus the OOD scale-guard report (None if no profile).
+
+        Same guardrail as the scored pipeline: on in-distribution data the
+        model output passes through untouched; on out-of-scale data the
+        revenue quantiles are blended with a trailing-ROAS baseline and the
+        interval is widened. ROAS always = revenue / planned spend.
+        """
         table = features.build_prediction_table(long_df)
         if budget_overrides:
             table = self._apply_budget_overrides(table, budget_overrides)
         campaign_pred = self.model.predict(table)
+        guard_info = None
+        if self.training_profile is not None:
+            campaign_pred, guard_info = scale_guard.run_guardrail(
+                campaign_pred, table,
+                getattr(self.model, "seasonal_index_", {}),
+                self.training_profile,
+                getattr(self.model, "fallback_", {}).get("global_median_roas", 1.0))
         full = reconcile.reconcile(campaign_pred)
-        return schema.validate_output(full)
+        return schema.validate_output(full), guard_info
 
     @staticmethod
     def _apply_budget_overrides(table: pd.DataFrame, overrides: dict) -> pd.DataFrame:
