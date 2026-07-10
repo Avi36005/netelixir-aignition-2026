@@ -365,3 +365,9 @@ These are isolated and trivially changeable; they do not block the pipeline:
    `budget_input`) or inferred (current trailing-extrapolation default).
 4. ~~Real dataset column names~~ — **confirmed**: the official Google/Bing/Meta
    exports are parsed natively (see *Official dataset support*).
+
+---
+
+## Team
+
+Built by **Team Kryptonite** for NetElixir AIgnition 3.0.
