@@ -371,3 +371,5 @@ These are isolated and trivially changeable; they do not block the pipeline:
 ## Team
 
 Built by **Team Kryptonite** for NetElixir AIgnition 3.0.
+
+Contributors include Sahil Deshmukh ([@sahil200511](https://github.com/sahil200511)).
