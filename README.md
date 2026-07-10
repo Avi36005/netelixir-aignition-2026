@@ -370,6 +370,14 @@ These are isolated and trivially changeable; they do not block the pipeline:
 
 ## Team
 
-Built by **Team Kryptonite** for NetElixir AIgnition 3.0.
+**Project Name:** ROAScast
+**Team Name:** Kryptonite
+**College:** Vivekanand Education Society's Institute Of Technology (VESIT)
 
-Contributors include Sahil Deshmukh ([@sahil200511](https://github.com/sahil200511)).
+**Team Members:**
+
+- Avinash Gehi
+- Hardik Hinduja
+- Sahil Deshmukh ([@sahil200511](https://github.com/sahil200511))
+
+Built for NetElixir AIgnition 3.0.
