@@ -378,6 +378,13 @@ GEMINI_API_KEY=your-key-here
 These keys affect **only** the product backend's `/explain` endpoint. `run.sh`
 and the scoring pipeline never read them and make no network calls.
 
+Adding a key is completely safe: it cannot change forecasts or the scored
+output. With or without a key, every AI response passes the same grounding
+guardrails (numbers, campaign/channel names, and evidence are validated
+against the forecast context), and any failing or unreachable provider simply
+falls back to the next one, ending at the deterministic template — the AI
+Insights page never breaks either way.
+
 **Optional local AI setup** (never required for scoring or the frontend):
 
 ```bash
