@@ -37,6 +37,10 @@ class ForecastModel:
         self.fallback_ = {}
         self.calib_factor_ = 1.0  # interval-width multiplier around P50 (1.0 = none)
         self.blend_weight_ = 1.0  # P50 = w*LightGBM + (1-w)*seasonal-ROAS baseline
+        # Per-window refinements learned on the calibration slice; the scalars
+        # above remain the pooled fallbacks (and keep old pickles compatible).
+        self.calib_factor_by_window_ = {}
+        self.blend_weight_by_window_ = {}
         self.log_target_ = True   # fit quantiles on log1p(revenue) (skew-robust);
         # quantiles are invariant under monotone transforms, so expm1 restores $
         self.target_coverage_ = 0.8
@@ -156,33 +160,66 @@ class ForecastModel:
         preds = np.sort(np.clip(preds, 0.0, None), axis=1)
         lo, mid, hi = preds[:, 0], preds[:, 1], preds[:, 2]
 
-        # --- blend weight (LightGBM-heavy grid; ties -> higher w = more GBM) ---
         baseline = self._baseline_p50(raw_calib.loc[cal_mask].reset_index(drop=True))
-        denom = float(np.sum(np.abs(yc))) or 1.0
-        best_w, best_wape = 1.0, float("inf")
-        for w in (1.0, 0.85, 0.7, 0.5):
-            wape = float(np.sum(np.abs(yc - (w * mid + (1.0 - w) * baseline)))) / denom
-            if wape < best_wape - 1e-9:  # strict improvement only
-                best_w, best_wape = w, wape
-        mid = best_w * mid + (1.0 - best_w) * baseline
-        lo, hi = np.minimum(lo, mid), np.maximum(hi, mid)
+        windows = raw_calib.loc[cal_mask, "window_days"].astype(int).to_numpy()
 
-        def coverage(f):
-            low = mid - f * (mid - lo)
-            high = mid + f * (hi - mid)
-            return float(np.mean((yc >= low) & (yc <= high)))
+        def pick_weight(sel):
+            """Blend weight by WAPE on the selected rows (LightGBM-heavy grid;
+            ties -> higher w = more GBM). Same grid as the original pooled fit."""
+            denom = float(np.sum(np.abs(yc[sel]))) or 1.0
+            best_w, best_wape = 1.0, float("inf")
+            for w in (1.0, 0.85, 0.7, 0.5):
+                blended = w * mid[sel] + (1.0 - w) * baseline[sel]
+                wape = float(np.sum(np.abs(yc[sel] - blended))) / denom
+                if wape < best_wape - 1e-9:  # strict improvement only
+                    best_w, best_wape = w, wape
+            return best_w
 
-        f_hi = 8.0
-        if coverage(f_hi) < target_coverage:
-            return best_w, f_hi
-        f_lo = 1.0
-        for _ in range(40):
-            mid_f = 0.5 * (f_lo + f_hi)
-            if coverage(mid_f) >= target_coverage:
-                f_hi = mid_f
-            else:
-                f_lo = mid_f
-        return best_w, float(f_hi)
+        def pick_factor(sel, mid_b, lo_b, hi_b):
+            """Smallest width factor reaching target coverage on the selected
+            rows (coverage is monotone in f -> binary search is stable)."""
+            def coverage(f):
+                low = mid_b[sel] - f * (mid_b[sel] - lo_b[sel])
+                high = mid_b[sel] + f * (hi_b[sel] - mid_b[sel])
+                return float(np.mean((yc[sel] >= low) & (yc[sel] <= high)))
+            f_hi = 8.0
+            if coverage(f_hi) < target_coverage:
+                return f_hi
+            f_lo = 1.0
+            for _ in range(40):
+                mid_f = 0.5 * (f_lo + f_hi)
+                if coverage(mid_f) >= target_coverage:
+                    f_hi = mid_f
+                else:
+                    f_lo = mid_f
+            return float(f_hi)
+
+        # --- pooled fit (identical math to the original single-pair version;
+        # these scalars stay the fallback for windows with thin calibration) ---
+        all_rows = np.ones(len(yc), dtype=bool)
+        best_w = pick_weight(all_rows)
+        mid_b = best_w * mid + (1.0 - best_w) * baseline
+        lo_b, hi_b = np.minimum(lo, mid_b), np.maximum(hi, mid_b)
+        pooled_f = pick_factor(all_rows, mid_b, lo_b, hi_b)
+
+        # --- per-window refinement: longer horizons typically want more
+        # baseline and different interval widths. A window keeps the pooled
+        # values unless it has enough calibration rows to stand on its own. ---
+        self.blend_weight_by_window_ = {}
+        self.calib_factor_by_window_ = {}
+        for w in sorted(set(windows.tolist())):
+            sel = windows == w
+            if sel.sum() < 15:  # too thin to calibrate separately
+                self.blend_weight_by_window_[int(w)] = best_w
+                self.calib_factor_by_window_[int(w)] = pooled_f
+                continue
+            w_w = pick_weight(sel)
+            mid_w = w_w * mid + (1.0 - w_w) * baseline
+            lo_w, hi_w = np.minimum(lo, mid_w), np.maximum(hi, mid_w)
+            self.blend_weight_by_window_[int(w)] = w_w
+            self.calib_factor_by_window_[int(w)] = pick_factor(sel, mid_w, lo_w, hi_w)
+
+        return best_w, pooled_f
 
     # ------------------------------------------------------------- inference
     def _booster(self, alpha):
@@ -209,16 +246,23 @@ class ForecastModel:
 
         # P50 ensemble: blend the GBM with the seasonal-ROAS baseline using the
         # backtest-selected weight (1.0 = pure GBM when the blend didn't help).
-        w = float(getattr(self, "blend_weight_", 1.0))
-        if w < 1.0 and "tr28_roas" in raw_df.columns:
+        # Weights/factors are per forecast window when the fitted maps exist;
+        # older pickles without the maps fall back to the pooled scalars.
+        wd = raw_df["window_days"].astype(int).to_numpy()
+        w_glob = float(getattr(self, "blend_weight_", 1.0))
+        w_map = getattr(self, "blend_weight_by_window_", None) or {}
+        w = np.array([float(w_map.get(int(x), w_glob)) for x in wd])
+        if (w < 1.0).any() and "tr28_roas" in raw_df.columns:
             mid = w * mid + (1.0 - w) * self._baseline_p50(raw_df)
             lo, hi = np.minimum(lo, mid), np.maximum(hi, mid)
 
         # Interval calibration — scale each side's distance from P50 by the
         # learned multiplier (scale-free across the campaign-to-blended magnitude
         # range). The point forecast P50 is left untouched.
-        f = getattr(self, "calib_factor_", 1.0)
-        if f and f != 1.0:
+        f_glob = float(getattr(self, "calib_factor_", 1.0) or 1.0)
+        f_map = getattr(self, "calib_factor_by_window_", None) or {}
+        f = np.array([float(f_map.get(int(x), f_glob)) for x in wd])
+        if (f != 1.0).any():
             lo = mid - f * (mid - lo)
             hi = mid + f * (hi - mid)
         preds = np.sort(np.clip(np.column_stack([lo, mid, hi]), 0.0, None), axis=1)
