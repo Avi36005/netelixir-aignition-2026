@@ -354,6 +354,30 @@ campaign stats in `data/`.
 - Tested in `tests/test_llm_guardrails.py` (invented numbers, fake campaigns,
   unsupported causality, provider-chain failure, keyless fallback).
 
+### API keys for the AI layer (for judges)
+
+**No key is required.** The AI Insights page always works: with zero keys and
+no Ollama, it uses the deterministic rule-based fallback (provider shown as
+`template` in the UI). To see a live LLM narrative, set **any one** of these in
+`product/backend/.env` (or the environment) before starting the backend —
+first available in this order wins:
+
+| provider | env variable | model used (default) |
+|---|---|---|
+| Ollama (local, no key) | `OLLAMA_HOST` (default `http://localhost:11434`) | `qwen3:8b` (or `OLLAMA_MODEL`) |
+| OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` (or `OPENAI_MODEL`) |
+| Google Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-2.0-flash` (or `GEMINI_MODEL`) |
+| Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` (or `GROQ_MODEL`) |
+
+Example `product/backend/.env` (gitignored — never committed):
+
+```bash
+GEMINI_API_KEY=your-key-here
+```
+
+These keys affect **only** the product backend's `/explain` endpoint. `run.sh`
+and the scoring pipeline never read them and make no network calls.
+
 **Optional local AI setup** (never required for scoring or the frontend):
 
 ```bash
